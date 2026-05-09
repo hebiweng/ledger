@@ -272,6 +272,7 @@ def run_backtest(params):
     else:
         dca_trades = []
         dca_only = []
+        annual = []
         _mo = None
 
     # ── Daily values for the main strategy ──
@@ -348,6 +349,42 @@ def run_backtest(params):
 
         dca_trades = combined_monthly
         dca_only = dca_only_monthly
+
+        # ── Annual aggregation ──
+        year_last_idx = {}
+        for i in range(len(dates_str)):
+            year_last_idx[dates_str[i][:4]] = i
+        annual = []
+        prev_year_val = 0.0
+        cum_trig_yr = 0.0
+        prev_cum_inv = 0.0
+        for yr in sorted(year_last_idx.keys()):
+            idx = year_last_idx[yr]
+            # Sum trigger cost for this year
+            trig_yr = sum(t["cost"] for t in trades if t["date"][:4] == yr)
+            # DCA cost for this year
+            dca_co_yr = _mo["dca_cost_run"][idx]
+            prev_yr_key = str(int(yr)-1)
+            prev_dca = _mo["dca_cost_run"][year_last_idx[prev_yr_key]] if prev_yr_key in year_last_idx else 0
+            dca_yr = dca_co_yr - prev_dca
+            total_yr = round(trig_yr + dca_yr, 2)
+            # Cumulative
+            cum_inv_yr = dca_co_yr + sum(t["cost"] for t in trades if t["date"][:4] <= yr)
+            cur_val_yr = combined_val[idx]
+            profit_yr = round(cur_val_yr - cum_inv_yr, 2)
+            ret_yr = round(profit_yr / cum_inv_yr * 100, 2) if cum_inv_yr > 0 else 0
+            annual.append({
+                "year": yr,
+                "trig_cost": round(trig_yr, 2),
+                "dca_cost": round(dca_yr, 2),
+                "year_invested": total_yr,
+                "cum_invested": round(cum_inv_yr, 2),
+                "year_end_value": round(cur_val_yr, 2),
+                "cum_profit": profit_yr,
+                "ret_pct": ret_yr,
+            })
+    else:
+        annual = []
 
     # ── Per-ticker breakdown ──
     ticker_breakdown = []
@@ -486,6 +523,7 @@ def run_backtest(params):
         "trades": trades,
         "dca_trades": dca_trades,
         "dca_only": dca_only,
+        "annual": annual,
         "ath_log": ath_log,
         "strategy_val": strategy_val,
         "dca_val": dca_daily_val,

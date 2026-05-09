@@ -82,6 +82,10 @@
     <div class="card-header">DCA 月报 <span style="font-weight:400;font-size:12px;color:var(--sumi-light);">— 仅 DCA 策略</span></div>
     <table><thead><tr><th>时间</th><th>当期投入</th><th>当期份额</th><th>累计份额</th><th>累计成本</th><th>累计市值</th><th>累计收益</th><th>累计收益率</th></tr></thead><tbody id="btDcaOnlyBody"></tbody></table>
   </div>
+  <div class="card" id="btAnnualTable" style="display:none;">
+    <div class="card-header">年度汇总 <span style="font-weight:400;font-size:12px;color:var(--sumi-light);">— 策略 + DCA</span></div>
+    <table><thead><tr><th>年份</th><th>策略买入</th><th>DCA买入</th><th>年度投入</th><th>累计投入</th><th>年末市值</th><th>累计收益</th><th>累计收益率</th></tr></thead><tbody id="btAnnualBody"></tbody></table>
+  </div>
 </div>
 
 <script>
@@ -360,6 +364,23 @@ function renderBuyLog(d) {
     </tr>`).join('');
   } else {
     dcaDiv.style.display = 'none';
+  }
+  // Annual table
+  const annDiv = document.getElementById('btAnnualTable');
+  if (d.annual && d.annual.length) {
+    annDiv.style.display = '';
+    document.getElementById('btAnnualBody').innerHTML = d.annual.map(t => `<tr>
+      <td style="font-weight:500;">${t.year}</td>
+      <td class="num-col">${t.trig_cost > 0 ? '$'+t.trig_cost.toLocaleString() : '—'}</td>
+      <td class="num-col">${t.dca_cost > 0 ? '$'+t.dca_cost.toLocaleString() : '—'}</td>
+      <td class="num-col" style="font-weight:500;">$${t.year_invested.toLocaleString()}</td>
+      <td class="num-col">$${t.cum_invested.toLocaleString()}</td>
+      <td class="num-col">$${t.year_end_value.toLocaleString()}</td>
+      <td class="num-col ${t.cum_profit>=0?'diff-positive':'diff-negative'}">${t.cum_profit>=0?'+':''}$${Math.abs(t.cum_profit).toLocaleString()}</td>
+      <td class="num-col ${t.ret_pct>=0?'diff-positive':'diff-negative'}">${t.ret_pct>=0?'+':''}${t.ret_pct}%</td>
+    </tr>`).join('');
+  } else {
+    annDiv.style.display = 'none';
   }
 }
 
