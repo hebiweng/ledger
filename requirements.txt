@@ -3,3 +3,6 @@ uvicorn[standard]
 jinja2
 sqlalchemy
 httpx
+yfinance
+pandas
+numpy
