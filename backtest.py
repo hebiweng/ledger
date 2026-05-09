@@ -26,12 +26,19 @@ def _fetch_one(ticker, start, end, max_retries=4):
     raise RuntimeError(f"Failed to fetch {ticker}")
 
 
+def _cache_dir():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
+
+
 def fetch_data(tickers, start, end, cache_key=None):
     """Fetch close prices for a list of tickers. Uses local CSV cache."""
+    cdir = _cache_dir()
+    os.makedirs(cdir, exist_ok=True)
+
     # Check for named cache files first (real/sim)
     for prefix in ["real", "sim"]:
         cf = f"cache_{prefix}.csv"
-        cp = os.path.join(os.path.dirname(os.path.abspath(__file__)), cf)
+        cp = os.path.join(cdir, cf)
         if os.path.exists(cp):
             cached = pd.read_csv(cp, index_col=0)
             cached.index = pd.to_datetime(cached.index, utc=True).tz_localize(None)
@@ -44,13 +51,14 @@ def fetch_data(tickers, start, end, cache_key=None):
                     return cached.loc[start:end][list(tickers)]
 
     if cache_key:
-        cache_file = f"cache_{cache_key}.csv"
-        cache_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), cache_file)
+        cache_path = os.path.join(cdir, f"cache_{cache_key}.csv")
         if os.path.exists(cache_path):
             print(f"  Loading from cache: {cache_path}")
             df = pd.read_csv(cache_path, index_col=0)
             df.index = pd.to_datetime(df.index, utc=True).tz_convert(None)
             return df
+    else:
+        cache_path = None
 
     closes = {}
     for t in tickers:
@@ -58,7 +66,7 @@ def fetch_data(tickers, start, end, cache_key=None):
         closes[t] = _fetch_one(t, start, end)
     result = pd.DataFrame(closes).ffill()
 
-    if cache_key:
+    if cache_path:
         result.to_csv(cache_path)
         print(f"  Cached to {cache_path}")
     return result
@@ -228,12 +236,43 @@ def run_backtest(params):
             dca_daily_val[i] = round(float(running_shares * closes[dca_ticker].iloc[i]), 2)
             dca_daily_cost[i] = round(float(running_cost), 2)
         dca_records = {
+            "enabled": True,
             "ticker": dca_ticker,
             "amount_per_day": dca_amount,
             "end_date": dca_end,
             "total_cost": round(float(running_cost), 2),
             "final_value": dca_daily_val[-1],
         }
+
+        # ── Monthly tables: prep data for deferred emission ──
+        _mo = {}  # builder state hoisted out of this block
+        _mo["month_last_idx"] = {}
+        _mo["dca_shares_run"] = []
+        _mo["dca_cost_run"] = []
+        _mo["dca_ticker"] = dca_ticker
+        run_sh = 0.0
+        run_co = 0.0
+        for i in range(len(closes)):
+            ym = dates_str[i][:7]
+            _mo["month_last_idx"][ym] = i
+            date_str = dates_str[i]
+            if date_str <= dca_end:
+                px = float(closes[dca_ticker].iloc[i])
+                if not pd.isna(px) and px > 0:
+                    run_sh += dca_amount / px
+                    run_co += dca_amount
+            _mo["dca_shares_run"].append(run_sh)
+            _mo["dca_cost_run"].append(run_co)
+        _mo["trig_cost_by_month"] = {}
+        for t in trades:
+            ym = t["date"][:7]
+            _mo["trig_cost_by_month"][ym] = _mo["trig_cost_by_month"].get(ym, 0.0) + t["cost"]
+
+        dca_trades = True  # flag, actual rows built after combined_val
+    else:
+        dca_trades = []
+        dca_only = []
+        _mo = None
 
     # ── Daily values for the main strategy ──
     # Aggregate by ticker
@@ -257,6 +296,59 @@ def run_backtest(params):
     # Combined (strategy + DCA)
     combined_val = [round(strategy_val[i] + dca_daily_val[i], 2) for i in range(len(closes))]
 
+    # ── Monthly table emission (deferred: needs combined_val) ──
+    if dca_trades == True:
+        combined_monthly = []
+        dca_only_monthly = []
+        prev_dca_sh = 0.0
+        prev_dca_co = 0.0
+        cum_trig = 0.0
+        dca_tk = _mo["dca_ticker"]
+        for ym in sorted(_mo["month_last_idx"].keys()):
+            idx = _mo["month_last_idx"][ym]
+            trig_m = _mo["trig_cost_by_month"].get(ym, 0.0)
+            cum_trig += trig_m
+            dca_sh = _mo["dca_shares_run"][idx]
+            dca_co = _mo["dca_cost_run"][idx]
+
+            # Combined table (strategy + DCA, accurate via combined_val)
+            cum_inv = cum_trig + dca_co
+            cur_val = combined_val[idx]
+            profit = round(cur_val - cum_inv, 2)
+            ret = round(profit / cum_inv * 100, 2) if cum_inv > 0 else 0
+            combined_monthly.append({
+                "date": ym,
+                "trig_cost": round(trig_m, 2),
+                "dca_cost": round(dca_co - prev_dca_co, 2),
+                "month_invested": round(trig_m + dca_co - prev_dca_co, 2),
+                "cum_invested": round(cum_inv, 2),
+                "cum_value": round(cur_val, 2),
+                "cum_profit": profit,
+                "ret_pct": ret,
+            })
+
+            # DCA-only table (single ticker, per-share accurate)
+            dca_px = float(closes[dca_tk].iloc[idx])
+            dca_val = dca_sh * dca_px
+            dca_profit = round(dca_val - dca_co, 2)
+            dca_ret = round(dca_profit / dca_co * 100, 2) if dca_co > 0 else 0
+            dca_only_monthly.append({
+                "date": ym,
+                "month_cost": round(dca_co - prev_dca_co, 2),
+                "month_shares": round(dca_sh - prev_dca_sh, 4),
+                "cum_shares": round(dca_sh, 4),
+                "cum_cost": round(dca_co, 2),
+                "cum_value": round(dca_val, 2),
+                "cum_profit": dca_profit,
+                "ret_pct": dca_ret,
+            })
+
+            prev_dca_sh = dca_sh
+            prev_dca_co = dca_co
+
+        dca_trades = combined_monthly
+        dca_only = dca_only_monthly
+
     # ── Per-ticker breakdown ──
     ticker_breakdown = []
     for tkr in sorted(ticker_shares.keys()):
@@ -273,6 +365,31 @@ def run_backtest(params):
             "value": round(val_t, 2), "pnl": round(pnl, 2),
             "pnl_pct": round(pnl_pct, 2),
         })
+
+    # Merge DCA into ticker breakdown
+    if dca_records:
+        dca_tk = dca_records["ticker"]
+        dca_sh = _mo["dca_shares_run"][-1] if _mo else 0
+        dca_co = dca_records["total_cost"]
+        dca_px = float(closes[dca_tk].iloc[-1])
+        dca_val = dca_sh * dca_px
+        dca_pnl = dca_val - dca_co
+        dca_pnl_pct = round(dca_pnl / dca_co * 100, 2) if dca_co > 0 else 0
+        # Check if DCA ticker already exists in breakdown
+        existing = next((tb for tb in ticker_breakdown if tb["ticker"] == dca_tk), None)
+        if existing:
+            existing["shares"] = round(existing["shares"] + dca_sh, 2)
+            existing["cost"] = round(existing["cost"] + dca_co, 2)
+            existing["value"] = round(existing["value"] + dca_val, 2)
+            existing["pnl"] = round(existing["value"] - existing["cost"], 2)
+            existing["pnl_pct"] = round(existing["pnl"] / existing["cost"] * 100, 2) if existing["cost"] > 0 else 0
+        else:
+            ticker_breakdown.insert(0, {
+                "ticker": dca_tk, "shares": round(dca_sh, 2),
+                "cost": round(dca_co, 2), "price": round(dca_px, 2),
+                "value": round(dca_val, 2), "pnl": round(dca_pnl, 2),
+                "pnl_pct": dca_pnl_pct,
+            })
 
     # ── Summary ──
     total_cost = sum(t["cost"] for t in trades)
@@ -293,12 +410,11 @@ def run_backtest(params):
                     max_dd = dd
         return round(max_dd, 2)
 
-    # B&H: if you invested the same total cost at day 0
-    bh_val = total_cost * float(underlying.iloc[-1]) / float(underlying.iloc[0]) if total_cost > 0 else 0
+    # B&H: same total capital as combined strategy
+    seed = combined_cost if combined_cost > 0 else 1
+    bh_val = seed * float(underlying.iloc[-1]) / float(underlying.iloc[0])
     bh_pct = (float(underlying.iloc[-1]) / float(underlying.iloc[0]) - 1) * 100
     bh_max_dd = calc_max_dd([float(x) for x in underlying])
-
-    combined_bh_val = combined_cost * float(underlying.iloc[-1]) / float(underlying.iloc[0]) if combined_cost > 0 else 0
 
     # ── Metrics: CAGR & Sharpe ──
     from datetime import datetime as _dt
@@ -346,7 +462,7 @@ def run_backtest(params):
     if has_spy and "SPY" in closes.columns:
         spy_series = closes["SPY"]
         spy_prices = [round(float(x), 2) for x in spy_series.tolist()]
-        ref_cost = total_cost if total_cost > 0 else combined_cost
+        ref_cost = seed
         spy_bh_val = ref_cost * float(spy_series.iloc[-1]) / float(spy_series.iloc[0]) if ref_cost > 0 else 0
         spy_sharpe = calc_sharpe_prices([float(x) for x in spy_series])
         spy_bh = {
@@ -368,6 +484,8 @@ def run_backtest(params):
         },
         "dates": dates_str,
         "trades": trades,
+        "dca_trades": dca_trades,
+        "dca_only": dca_only,
         "ath_log": ath_log,
         "strategy_val": strategy_val,
         "dca_val": dca_daily_val,
@@ -386,6 +504,8 @@ def run_backtest(params):
             "dca_value": dca_records["final_value"] if dca_records else 0,
             "dca_return_pct": round((dca_records["final_value"] / dca_records["total_cost"] - 1) * 100, 2) if dca_records and dca_records["total_cost"] > 0 else 0,
             "dca_cagr": calc_cagr(dca_records["total_cost"] if dca_records else 0, dca_records["final_value"] if dca_records else 0) if dca_records else 0,
+            "dca_max_dd_pct": calc_max_dd(dca_daily_val) if dca_records else None,
+            "dca_sharpe": calc_sharpe(dca_daily_val, dca_records["total_cost"] if dca_records else 0) if dca_records else None,
             "combined_cost": round(combined_cost, 2),
             "combined_value": round(combined_final, 2),
             "combined_return_pct": round((combined_final / combined_cost - 1) * 100, 2) if combined_cost > 0 else 0,
@@ -397,8 +517,8 @@ def run_backtest(params):
         },
         "buy_hold": {
             "symbol": symbol,
-            "cost": round(total_cost if total_cost > 0 else combined_cost, 2),
-            "final_value": round(float(bh_val), 2) if total_cost > 0 else round(float(combined_bh_val), 2),
+            "cost": round(seed, 2),
+            "final_value": round(float(bh_val), 2),
             "return_pct": round(bh_pct, 2),
             "cagr": round(((float(underlying.iloc[-1]) / float(underlying.iloc[0])) ** (1 / years) - 1) * 100, 2),
             "sharpe": calc_sharpe_prices([float(x) for x in underlying]),

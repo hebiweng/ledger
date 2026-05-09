@@ -11,7 +11,10 @@ screenshots/
 __pycache__/
 *.pyc
 
+# Cache & output
+cache/
+output/
+
 # Temp / test files
-cache_spy_*.csv
-cache_6376.csv
 image.png
+.DS_Store
