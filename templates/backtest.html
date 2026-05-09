@@ -1,0 +1,343 @@
+{% extends "base.html" %}
+{% block content %}
+
+<div class="card">
+  <div class="card-header">回测参数</div>
+
+  <!-- Row 1: basic config -->
+  <div class="form-grid-4">
+    <div class="field"><label>标的代码</label><input id="btSymbol" value="QQQ" style="text-transform:uppercase;"></div>
+    <div class="field"><label>起始日期</label><input id="btStart" type="date" value="2016-05-06"></div>
+    <div class="field"><label>结束日期</label><input id="btEnd" type="date" value="2026-05-06"></div>
+    <div class="field"></div>
+  </div>
+
+  <!-- Toggles: all on one line -->
+  <div style="display:flex;gap:18px;align-items:center;flex-wrap:wrap;margin-bottom:16px;font-size:12.5px;">
+    <label style="display:flex;align-items:center;gap:4px;cursor:pointer;white-space:nowrap;">
+      <input type="checkbox" id="btAthReset" checked onchange="toggleRapid()" style="width:14px;height:14px;margin:0;">ATH 重置
+    </label>
+    <label style="display:flex;align-items:center;gap:4px;cursor:pointer;white-space:nowrap;">
+      <input type="checkbox" id="btRapidEnabled" onchange="toggleRapid()" style="width:14px;height:14px;margin:0;">快速上涨
+    </label>
+    <span id="rapidOpts" style="display:none;display:flex;gap:4px;align-items:center;white-space:nowrap;">
+      <input id="btRapidDays" type="number" value="21" step="1" style="width:42px;height:28px;text-align:center;"> 天涨超
+      <input id="btRapidPct" type="number" value="10" step="1" style="width:46px;height:28px;text-align:center;"> % 启用深档
+    </span>
+    <span style="color:var(--border);margin:0 4px;">|</span>
+    <label style="display:flex;align-items:center;gap:4px;cursor:pointer;white-space:nowrap;">
+      <input type="checkbox" id="btDcaEnabled" onchange="toggleDca()" style="width:14px;height:14px;margin:0;">定投
+    </label>
+    <span id="dcaOpts" style="display:none;display:flex;gap:5px;align-items:center;white-space:nowrap;">
+      <input id="btDcaTicker" value="QQQ" style="width:52px;height:28px;text-transform:uppercase;text-align:center;">
+      每日 $<input id="btDcaAmount" type="number" value="40" step="1" style="width:52px;height:28px;text-align:center;">
+      截止 <input id="btDcaEnd" type="date" value="2026-05-06" style="height:28px;width:120px;">
+    </span>
+  </div>
+
+  <!-- Trigger rules -->
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+    <span style="font-family:var(--font-display);font-style:italic;font-size:17px;font-weight:600;">触发买入规则</span>
+    <button class="btn btn-primary btn-sm" onclick="addTrigger()">+ 添加档位</button>
+  </div>
+  <div id="triggerList"></div>
+
+  <!-- Run -->
+  <div style="margin-top:16px;display:flex;align-items:center;gap:16px;">
+    <button class="btn btn-primary" id="btRunBtn" onclick="runBacktest()">▶ 运行回测</button>
+    <span style="font-size:11px;color:var(--sumi-light);">数据来源: Yahoo Finance · 首次拉取较慢，后续走本地缓存</span>
+  </div>
+</div>
+
+<div id="btResults" style="display:none;">
+  <div class="card">
+    <div class="card-header">业绩对比 <span style="font-weight:400;font-size:12px;color:var(--sumi-light);" id="btYears"></span></div>
+    <div id="btSummary"></div>
+  </div>
+  <div class="card">
+    <div class="card-header">净值曲线 <span style="font-weight:400;font-size:12px;color:var(--sumi-light);">— 归一化起点 = 初始投入</span></div>
+    <div class="chart-wrap"><canvas id="chartNav"></canvas></div>
+  </div>
+  <div class="card">
+    <div class="card-header">回撤曲线</div>
+    <div class="chart-wrap"><canvas id="chartDD"></canvas></div>
+  </div>
+  <div class="card">
+    <div class="card-header">ATH 轮次</div>
+    <table><thead><tr><th>ATH 日期</th><th>价格</th><th>模式</th><th>交易笔数</th></tr></thead><tbody id="btAthLog"></tbody></table>
+  </div>
+  <div class="card">
+    <div class="card-header">买入明细 <span style="font-weight:400;font-size:12px;color:var(--sumi-light);">（共 <span id="btTradeCount">0</span> 笔）</span></div>
+    <table style="table-layout:fixed;"><thead><tr><th style="width:9%;">ATH</th><th style="width:9%;">日期</th><th style="width:8%;">触发</th><th style="width:8%;">实际跌</th><th style="width:7%;">标的</th><th style="width:10%;">价格</th><th style="width:7%;">股数</th><th style="width:10%;">金额</th></tr></thead><tbody id="btBuyLog"></tbody></table>
+  </div>
+  <div class="card">
+    <div class="card-header">持仓汇总</div>
+    <div id="btHoldings"></div>
+  </div>
+</div>
+
+<script>
+function toggleRapid() {
+  const chk = document.getElementById('btRapidEnabled').checked;
+  document.getElementById('rapidOpts').style.display = chk ? '' : 'none';
+}
+function toggleDca() {
+  const chk = document.getElementById('btDcaEnabled').checked;
+  document.getElementById('dcaOpts').style.display = chk ? '' : 'none';
+}
+
+// ── Trigger builder ──
+let triggerCount = 0;
+
+function addTrigger(ddPct, buys) {
+  const id = triggerCount++;
+  const sym = (document.getElementById('btSymbol').value||'QQQ');
+  const dd = ddPct != null ? ddPct : '';
+  const html = `<div class="trigger-row" id="trig${id}" style="margin-bottom:10px;padding:14px 18px;background:var(--washi);border-radius:8px;border:1px solid var(--border-light);">
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;">
+      <span style="font-size:13.5px;font-weight:500;">当 <b>${sym}</b> 从新高下跌</span>
+      <input id="trigDD${id}" type="number" value="${dd}" step="1" style="width:64px;height:34px;text-align:center;font-weight:600;font-size:15px;" placeholder="10">
+      <span style="font-size:13.5px;font-weight:500;">% 时，买入以下标的：</span>
+      <button class="btn btn-danger btn-xs" onclick="document.getElementById('trig${id}').remove()" style="margin-left:auto;">删除</button>
+    </div>
+    <div id="trigBuys${id}" style="display:grid;grid-template-columns:repeat(auto-fill, minmax(340px, 1fr));gap:6px;margin-bottom:8px;"></div>
+    <button class="btn btn-secondary btn-xs" onclick="addBuy(${id})" style="margin-top:2px;">+ 添加标的</button>
+  </div>`;
+  document.getElementById('triggerList').insertAdjacentHTML('beforeend', html);
+  if (buys && buys.length) {
+    buys.forEach(b => addBuy(id, b));
+  } else {
+    addBuy(id);
+  }
+}
+
+function addBuy(trigId, preset) {
+  const container = document.getElementById(`trigBuys${trigId}`);
+  const ticker = (preset && preset.ticker) ? preset.ticker : document.getElementById('btSymbol').value || 'QQQ';
+  const mode = (preset && preset.mode) || 'amount';
+  const val = (preset && preset.value != null) ? preset.value : 1000;
+  const div = document.createElement('div');
+  div.style.cssText = 'display:flex;align-items:center;gap:8px;background:#FFFDF9;padding:5px 10px;border-radius:6px;border:1px solid var(--border-light);';
+  div.innerHTML = `<span style="font-size:12px;color:var(--sumi-light);width:28px;">买入</span>
+    <input value="${ticker}" style="width:72px;height:32px;text-transform:uppercase;text-align:center;font-weight:500;" placeholder="QQQ">
+    <select style="width:96px;height:32px;font-size:13px;" onchange="this.nextElementSibling.placeholder=this.value==='shares'?'股数':'金额 $';this.nextElementSibling.step=this.value==='shares'?'1':'100';">
+      <option value="amount" ${mode==='amount'?'selected':''}>金额 $</option>
+      <option value="shares" ${mode==='shares'?'selected':''}>股数</option>
+    </select>
+    <input type="number" value="${val}" step="${mode==='shares'?'1':'100'}" style="width:100px;height:32px;" placeholder="${mode==='amount'?'金额 $':'股数'}">
+    <button class="btn btn-danger btn-xs" onclick="this.parentElement.remove()" style="flex-shrink:0;">✕</button>`;
+  container.appendChild(div);
+}
+
+// ── Collect form data ──
+function collectParams() {
+  const triggers = [];
+  document.querySelectorAll('.trigger-row').forEach(row => {
+    const ddEl = row.querySelector('[id^="trigDD"]');
+    const dd = parseFloat(ddEl.value);
+    if (isNaN(dd)) return;
+    const buys = [];
+    row.querySelectorAll('[id^="trigBuys"] > div').forEach(span => {
+      const inputs = span.querySelectorAll('input, select');
+      const ticker = inputs[0].value.toUpperCase();
+      const mode = inputs[1].value;
+      const value = parseFloat(inputs[2].value);
+      if (ticker && !isNaN(value)) buys.push({ ticker, mode, value });
+    });
+    if (buys.length) triggers.push({ drawdown_pct: -Math.abs(dd) / 100, buys });
+  });
+  return {
+    symbol: document.getElementById('btSymbol').value.toUpperCase(),
+    start: document.getElementById('btStart').value,
+    end: document.getElementById('btEnd').value,
+    ath_reset: document.getElementById('btAthReset').checked,
+    rapid_rally: document.getElementById('btRapidEnabled').checked ? {
+      enabled: true,
+      days: parseInt(document.getElementById('btRapidDays').value) || 21,
+      pct: (parseFloat(document.getElementById('btRapidPct').value) || 10) / 100,
+    } : { enabled: false },
+    triggers,
+    dca: document.getElementById('btDcaEnabled').checked ? {
+      enabled: true,
+      ticker: document.getElementById('btDcaTicker').value.toUpperCase(),
+      amount_per_day: parseFloat(document.getElementById('btDcaAmount').value) || 0,
+      end_date: document.getElementById('btDcaEnd').value,
+    } : { enabled: false },
+  };
+}
+
+// ── Run ──
+let chartNav=null, chartDD=null;
+
+async function runBacktest() {
+  const params = collectParams();
+  if (!params.symbol || !params.start || !params.end) return toast('请填写标的、起始/结束日期', 'err');
+  if (!params.triggers.length && !params.dca.enabled) return toast('至少添加一个触发档位或启用定投', 'err');
+
+  const btn = document.getElementById('btRunBtn');
+  btn.textContent = '⏳ 获取数据中...'; btn.disabled = true;
+  try {
+    const r = await fetch('/api/backtest/run', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(params) });
+    if (!r.ok) { const e = await r.json(); throw new Error(e.detail || 'Server error'); }
+    const d = await r.json();
+    document.getElementById('btResults').style.display = '';
+    renderResults(d);
+    btn.textContent = '▶ 运行回测';
+  } catch(e) {
+    toast('回测失败: ' + e.message, 'err');
+  }
+  btn.disabled = false;
+}
+
+function renderResults(d) {
+  renderSummary(d);
+  renderCharts(d);
+  renderAthLog(d);
+  renderBuyLog(d);
+  renderHoldings(d);
+}
+
+function renderSummary(d) {
+  const s = d.summary, bh = d.buy_hold;
+  const p = (v) => (v >= 0 ? '+' : '') + (v != null ? v.toFixed(2) : '—');
+  const cls = v => v >= 0 ? 'diff-positive' : 'diff-negative';
+  const hasDca = d.config.dca && d.config.dca.enabled;
+  const nbsp = v => v != null ? v : '—';
+
+  // Build rows
+  const rows = [
+    ['回撤触发策略', s.total_cost, s.final_value, s.return_pct, s.cagr, s.max_dd_pct, s.sharpe, s.trade_count + ' 笔'],
+    ...(hasDca ? [
+      [`DCA (${d.config.dca.ticker})`, s.dca_cost, s.dca_value, s.dca_return_pct, s.dca_cagr, '—', '—', '—'],
+      ['合并 (策略+DCA)', s.combined_cost, s.combined_value, s.combined_return_pct, s.combined_cagr, s.combined_max_dd_pct, s.combined_sharpe, '—'],
+    ] : [
+      ['合并 (策略+DCA)', s.total_cost, s.final_value, s.return_pct, s.cagr, s.max_dd_pct, s.sharpe, s.trade_count + ' 笔'],
+    ]),
+    [`${d.config.symbol} Buy & Hold`, bh.cost, bh.final_value, bh.return_pct, bh.cagr, bh.max_dd_pct, bh.sharpe, '—'],
+  ];
+  if (d.spy_benchmark) {
+    const spy = d.spy_benchmark;
+    rows.push(['SPY Buy & Hold', spy.cost, spy.final_value, spy.return_pct, spy.cagr, spy.max_dd_pct, spy.sharpe, '—']);
+  }
+
+  const cell = (v, isPct, isDd) => {
+    if (v == null || v === '—') return '<td class="num-col" style="color:var(--sumi-light);">—</td>';
+    if (typeof v === 'string') return `<td class="num-col">${v}</td>`;
+    const c = (isPct || isDd) ? cls(v) : '';
+    const sign = isDd ? '' : (v >= 0 ? '+' : '');
+    return `<td class="num-col ${c}" style="font-weight:500;">${isPct||isDd?sign+v.toFixed(2)+'%':'$'+v.toLocaleString()}</td>`;
+  };
+
+  document.getElementById('btSummary').innerHTML = `
+    <table style="table-layout:fixed;"><thead><tr>
+      <th>策略</th><th>投入</th><th>终值</th><th>总收益</th><th>CAGR</th><th>最大回撤</th><th>夏普</th><th>交易</th>
+    </tr></thead><tbody>${rows.map(r => `<tr style="${r[0].includes('合并')?'background:var(--indigo-subtle);':''}">
+      <td style="font-weight:${r[0].includes('合并')||r[0].includes('回撤')?'600':'400'};">${r[0]}</td>
+      ${cell(r[1], false, false)}${cell(r[2], false, false)}${cell(r[3], true, false)}${cell(r[4], true, false)}${cell(r[5], true, true)}${cell(r[6])}${cell(r[7])}
+    </tr>`).join('')}</tbody></table>
+  `;
+  document.getElementById('btYears').textContent = `— ${s.years}年`;
+}
+
+function renderCharts(d) {
+  const dates = d.dates;
+  const step = Math.max(1, Math.floor(dates.length / 80));
+  const lbls = dates.filter((_,i) => i % step === 0);
+  const thin = (arr) => arr.filter((_,i) => i % step === 0);
+
+  // NAV
+  const ctx1 = document.getElementById('chartNav').getContext('2d');
+  if (chartNav) chartNav.destroy();
+  const hasDca = d.config.dca && d.config.dca.enabled;
+  const mainLabel = hasDca ? '合并 (策略+DCA)' : '回撤触发策略';
+  const mainData = hasDca ? d.combined_val : d.strategy_val;
+  const datasets = [
+    { label: mainLabel, data: thin(mainData), borderColor: '#B54A45', backgroundColor: 'transparent', tension: 0.2, pointRadius: 0, borderWidth: 2.5 },
+  ];
+  if (hasDca) {
+    datasets.push({ label: '回撤触发', data: thin(d.strategy_val), borderColor: '#3B5998', backgroundColor: 'transparent', tension: 0.2, pointRadius: 0, borderWidth: 1.5, borderDash: [4,2] });
+  }
+  // Benchmarks: underlying B&H + SPY
+  const bhCost = d.summary.total_cost || d.summary.combined_cost;
+  if (bhCost > 0 && d.underlying_prices) {
+    const initPx = d.underlying_prices[0];
+    const bhVals = d.underlying_prices.map(px => bhCost * px / initPx);
+    datasets.push({ label: d.config.symbol + ' B&H', data: thin(bhVals), borderColor: '#7A766E', backgroundColor: 'transparent', tension: 0.2, pointRadius: 0, borderWidth: 1.2, borderDash: [8,4] });
+  }
+  if (bhCost > 0 && d.spy_prices) {
+    const spyInit = d.spy_prices[0];
+    const spyVals = d.spy_prices.map(px => bhCost * px / spyInit);
+    datasets.push({ label: 'SPY B&H', data: thin(spyVals), borderColor: '#5B7B4A', backgroundColor: 'transparent', tension: 0.2, pointRadius: 0, borderWidth: 1.2, borderDash: [3,3] });
+  }
+  chartNav = new Chart(ctx1, { type:'line', data:{labels: lbls, datasets},
+    options: { responsive: true, maintainAspectRatio: false, interaction: {mode: 'index', intersect: false},
+      plugins: { tooltip: { callbacks: { label: ctx => ctx.dataset.label + ': $' + Math.round(ctx.parsed.y).toLocaleString() } } },
+      scales: { y: { ticks: { callback: v => '$' + Math.round(v).toLocaleString() } } } } });
+
+  // Drawdown
+  const calcDD = (vals) => { let peak=0, dd=[]; for(const v of vals){ if(v>peak)peak=v; dd.push(peak>0?((v-peak)/peak*100):0); } return dd; };
+  const ctx2 = document.getElementById('chartDD').getContext('2d');
+  if (chartDD) chartDD.destroy();
+  const ddDatasets = [
+    { label: mainLabel, data: thin(calcDD(mainData)), borderColor: '#B54A45', backgroundColor: 'rgba(181,74,69,0.1)', fill: true, tension: 0.2, pointRadius: 0, borderWidth: 2 },
+  ];
+  if (d.underlying_prices) {
+    ddDatasets.push({ label: d.config.symbol + ' B&H', data: thin(calcDD(d.underlying_prices.map(px => bhCost * px / d.underlying_prices[0]))), borderColor: '#7A766E', borderDash: [6,3], backgroundColor: 'transparent', tension: 0.2, pointRadius: 0, borderWidth: 1 });
+  }
+  if (d.spy_prices) {
+    const spyInit2 = d.spy_prices[0];
+    ddDatasets.push({ label: 'SPY B&H', data: thin(calcDD(d.spy_prices.map(px => bhCost * px / spyInit2))), borderColor: '#5B7B4A', borderDash: [3,3], backgroundColor: 'transparent', tension: 0.2, pointRadius: 0, borderWidth: 1 });
+  }
+  chartDD = new Chart(ctx2, { type:'line', data:{labels: lbls, datasets: ddDatasets},
+    options: { responsive: true, maintainAspectRatio: false, interaction: {mode: 'index', intersect: false},
+      scales: { y: { ticks: { callback: v => v.toFixed(0) + '%' }, title: {display: true, text: '回撤 %'} } } } });
+}
+
+function renderAthLog(d) {
+  const log = d.ath_log;
+  if (!log.length) { document.getElementById('btAthLog').innerHTML = '<tr><td colspan="4">无 ATH 记录</td></tr>'; return; }
+  const trades = d.trades;
+  document.getElementById('btAthLog').innerHTML = log.map(a => {
+    const n = trades.filter(t => t.ath_date === a.date).length;
+    return n === 0 ? '' : `<tr>
+      <td style="font-weight:500;">${a.date}</td><td class="num-col">$${a.price.toLocaleString()}</td>
+      <td>${a.mode==='rapid'?'<span class="badge badge-red">⚡Rapid</span>':'<span class="badge badge-blue">Normal</span>'}</td>
+      <td class="num-col">${n}</td></tr>`;
+  }).join('');
+}
+
+function renderBuyLog(d) {
+  document.getElementById('btTradeCount').textContent = d.trades.length;
+  document.getElementById('btBuyLog').innerHTML = d.trades.length===0 ? '<tr><td colspan="8">无交易</td></tr>' :
+    d.trades.map(t => `<tr>
+      <td>${t.ath_date}</td><td>${t.date}</td><td>${t.trigger}</td><td>${t.dd_actual}</td>
+      <td>${t.ticker}</td><td class="num-col">$${t.price.toLocaleString()}</td>
+      <td class="num-col">${t.shares.toLocaleString()}</td><td class="num-col">$${t.cost.toLocaleString()}</td>
+    </tr>`).join('');
+}
+
+function renderHoldings(d) {
+  const s = d.summary, bd = d.ticker_breakdown;
+  document.getElementById('btHoldings').innerHTML = `
+    <table><thead><tr><th>标的</th><th>持仓</th><th>成本</th><th>现价</th><th>市值</th><th>盈亏</th><th>盈亏%</th></tr></thead>
+    <tbody>${bd.map(tb => `<tr>
+      <td style="font-weight:500;">${tb.ticker}</td><td class="num-col">${tb.shares.toLocaleString()}</td>
+      <td class="num-col">$${tb.cost.toLocaleString()}</td><td class="num-col">$${tb.price.toLocaleString()}</td>
+      <td class="num-col">$${tb.value.toLocaleString()}</td>
+      <td class="num-col ${tb.pnl>=0?'diff-positive':'diff-negative'}">${tb.pnl>=0?'+':''}$${Math.abs(tb.pnl).toLocaleString()}</td>
+      <td class="num-col ${tb.pnl_pct>=0?'diff-positive':'diff-negative'}">${tb.pnl_pct>=0?'+':''}${tb.pnl_pct}%</td>
+    </tr>`).join('')}
+    <tr style="font-weight:600;"><td>合计</td><td></td><td>$${s.total_cost.toLocaleString()}</td><td></td><td>$${s.final_value.toLocaleString()}</td><td class="${s.final_value-s.total_cost>=0?'diff-positive':'diff-negative'}">${s.final_value-s.total_cost>=0?'+':''}$${Math.abs(s.final_value-s.total_cost).toLocaleString()}</td><td class="${s.return_pct>=0?'diff-positive':'diff-negative'}">${s.return_pct>=0?'+':''}${s.return_pct}%</td></tr>
+    </tbody></table>
+  `;
+}
+
+// ── Init defaults ──
+toggleRapid();
+toggleDca();
+addTrigger(10, [{ticker:'QQQ', mode:'amount', value:1000}]);
+addTrigger(20, [{ticker:'QQQ', mode:'amount', value:1000}, {ticker:'QLD', mode:'amount', value:1000}]);
+addTrigger(30, [{ticker:'QQQ', mode:'amount', value:1000}, {ticker:'QLD', mode:'amount', value:1000}, {ticker:'TQQQ', mode:'amount', value:1000}]);
+</script>
+
+{% endblock %}

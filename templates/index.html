@@ -1,0 +1,333 @@
+{% extends "base.html" %}
+{% block content %}
+
+<div class="month-picker">
+  <button class="arrow" onclick="changeMonth(-1)">◀</button>
+  <span class="label" id="monthLabel">—</span>
+  <button class="arrow" onclick="changeMonth(1)">▶</button>
+  <button class="btn btn-secondary btn-sm" onclick="goToToday()">本月</button>
+</div>
+
+<!-- Balance table -->
+<div class="card">
+  <div class="card-header">账户余额</div>
+  <table id="balanceTable">
+    <thead>
+      <tr>
+        <th>账户</th><th>币种</th><th>上月余额</th><th>本月余额</th><th>换算 CNY</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+    <tfoot>
+      <tr class="total-row">
+        <td colspan="4">总资产 (CNY)</td>
+        <td id="totalCny" style="font-weight:700; font-size:16px;">—</td>
+      </tr>
+    </tfoot>
+  </table>
+  <div style="margin-top:12px;">
+    <button class="btn btn-primary btn-sm" onclick="saveBalances()">保存余额</button>
+    <span id="saveMsg" style="margin-left:10px; font-size:13px; color:var(--matcha);"></span>
+  </div>
+</div>
+
+<!-- Income section -->
+<div class="card">
+  <div class="card-header">本月收入</div>
+  <div id="incomeList"></div>
+  <div class="form-row" style="margin-top:12px;">
+    <div class="field"><label>来源</label><input id="incSource" placeholder="工资"></div>
+    <div class="field"><label>金额</label><input id="incAmount" type="number" step="0.01"></div>
+    <div class="field"><label>入账账户</label><select id="incAccount"><option value="">—</option></select></div>
+    <div class="field"><label>备注</label><input id="incNotes" style="width:160px;"></div>
+    <button class="btn btn-primary btn-sm" onclick="addIncome()" style="align-self:flex-end;">+ 添加</button>
+  </div>
+</div>
+
+<!-- Summary card -->
+<div class="card">
+  <div class="card-header">本月汇总</div>
+  <div class="summary-grid">
+    <div class="summary-card">
+      <div class="label">上月总资产</div>
+      <div class="value" id="sumPrev">—</div>
+    </div>
+    <div class="summary-card">
+      <div class="label">本月收入</div>
+      <div class="value positive" id="sumIncome">—</div>
+    </div>
+    <div class="summary-card">
+      <div class="label">本月总资产</div>
+      <div class="value" id="sumCurr">—</div>
+    </div>
+    <div class="summary-card">
+      <div class="label">本月花费</div>
+      <div class="value negative" id="sumSpending">—</div>
+    </div>
+  </div>
+  <div style="font-size:13px; color:var(--sumi-light);">
+    花费 = 上月总资产 + 本月收入 − 本月总资产
+  </div>
+</div>
+
+<!-- Trend chart -->
+<div class="card">
+  <div class="card-header">近12月趋势</div>
+  <div class="chart-wrap"><canvas id="trendChart"></canvas></div>
+</div>
+
+<script>
+const now = new Date();
+let curYear = now.getFullYear(), curMonth = now.getMonth() + 1;
+let accounts = [], balances = {}, incomes = [];
+
+function fmtMonth(y, m) { return `${y} 年 ${m} 月`; }
+function ymPrefix(y, m) { return `${y}-${String(m).padStart(2,'0')}-`; }
+function goToToday() { curYear = now.getFullYear(); curMonth = now.getMonth() + 1; loadAll(); }
+
+function changeMonth(d) {
+  curMonth += d;
+  if (curMonth > 12) { curMonth = 1; curYear++; }
+  if (curMonth < 1) { curMonth = 12; curYear--; }
+  loadAll();
+}
+
+async function loadAccounts() {
+  const r = await fetch('/api/accounts'); accounts = await r.json();
+  // Build flat list with sub-accounts for income/expense selectors
+  window._allSubAccounts = [];
+  const sel = document.getElementById('incAccount');
+  sel.innerHTML = '<option value="">—</option>';
+  accounts.forEach(a => {
+    if (a.multi && a.currencies) {
+      a.currencies.forEach(c => {
+        sel.innerHTML += `<option value="${c.id}">${a.name} (${c.currency})</option>`;
+        window._allSubAccounts.push({ id: c.id, name: a.name, currency: c.currency, parent_id: a.id });
+      });
+    } else {
+      sel.innerHTML += `<option value="${a.id}">${a.name}</option>`;
+    }
+  });
+}
+
+async function loadBalances() {
+  const r = await fetch(`/api/balances?year=${curYear}&month=${curMonth}`);
+  const data = await r.json();
+  balances = {};
+  data.items.forEach(it => { balances[it.account_id] = it; });
+  document.getElementById('totalCny').textContent = '¥' + data.total_cny.toLocaleString();
+  document.getElementById('monthLabel').textContent = fmtMonth(curYear, curMonth);
+  renderBalanceTable(data.items);
+}
+
+function renderBalanceTable(items) {
+  const tbody = document.querySelector('#balanceTable tbody');
+  let html = '';
+  items.forEach(it => {
+    const badges = { investment: '<span class="badge badge-blue">投资</span>', credit: '<span class="badge badge-red">信用</span>' };
+    const badge = badges[it.type] || '';
+
+    if (it.multi && it.subs) {
+      // Multi-currency: show parent row + expandable sub-rows
+      html += `<tr style="cursor:pointer;" onclick="toggleSubRows(${it.account_id})">
+        <td><span class="account-link">${it.account_name}</span> ${badge}<span class="badge badge-blue" style="margin-left:4px;">多币种</span></td>
+        <td><span style="font-size:11px;color:var(--sumi-light);">${it.subs.map(s => s.currency).join('/')}</span></td>
+        <td style="color:var(--sumi-light);">—</td>
+        <td style="font-weight:600;">¥${it.balance_cny != null ? it.balance_cny.toLocaleString() : '—'}</td>
+        <td style="font-weight:500;">¥${it.balance_cny != null ? it.balance_cny.toLocaleString() : '—'}</td>
+      </tr>`;
+      it.subs.forEach(s => {
+        html += `<tr class="sub-row-${it.account_id}" style="display:none;background:var(--washi-hover);">
+          <td style="padding-left:24px;font-size:12px;color:var(--sumi-light);">↳ ${s.currency}</td>
+          <td>${s.currency}</td>
+          <td style="color:var(--sumi-light);">—</td>
+          <td><input class="inline-edit" type="number" step="0.01" value="${s.balance}"
+                     data-acc="${s.sub_id}" data-curr="${s.currency}"
+                     oninput="onBalanceChange();scheduleAutoSave()"></td>
+          <td style="font-weight:500;font-size:13px;">${s.balance_cny != null ? '¥'+s.balance_cny.toLocaleString() : '—'}</td>
+        </tr>`;
+      });
+    } else {
+      const cnyDisplay = it.balance_cny != null ? `¥${it.balance_cny.toLocaleString()}` :
+        (it.valid_currency === false ? '<span style="color:var(--beni);font-size:12px;">无效币种</span>' : '<span style="color:var(--kuchiba);font-size:12px;">无汇率</span>');
+      html += `<tr>
+        <td><a href="javascript:void(0)" onclick="showAccountDetail(${it.account_id})" class="account-link">${it.account_name}</a> ${badge}</td>
+        <td>${it.currency}</td>
+        <td style="color:var(--sumi-light);">¥${(it.prev_balance || 0).toLocaleString()}</td>
+        <td><input class="inline-edit" type="number" step="0.01" value="${it.balance}"
+                   data-acc="${it.account_id}" data-curr="${it.currency}"
+                   oninput="onBalanceChange();scheduleAutoSave()"></td>
+        <td style="font-weight:500;">${cnyDisplay}</td>
+      </tr>`;
+    }
+  });
+  tbody.innerHTML = html;
+}
+
+function toggleSubRows(accId) {
+  document.querySelectorAll(`.sub-row-${accId}`).forEach(row => {
+    row.style.display = row.style.display === 'none' ? '' : 'none';
+  });
+}
+
+function onBalanceChange() {
+  let total = 0;
+  document.querySelectorAll('#balanceTable tbody input').forEach(inp => {
+    const accId = parseInt(inp.dataset.acc);
+    const bal = parseFloat(inp.value) || 0;
+    const curr = inp.dataset.curr;
+    // Look up rate from sub-account data or top-level balance
+    let rate = null;
+    for (const item of Object.values(balances)) {
+      if (item.multi && item.subs) {
+        const s = item.subs.find(s => s.sub_id === accId);
+        if (s && s.rate) { rate = s.rate; break; }
+      } else if (item.account_id === accId && item.rate) {
+        rate = item.rate; break;
+      }
+    }
+    if (rate) {
+      total += bal * rate;
+    } else {
+      total += bal;
+    }
+  });
+  document.getElementById('totalCny').textContent = '¥' + total.toLocaleString();
+}
+
+async function saveBalances() {
+  const items = [];
+  document.querySelectorAll('#balanceTable tbody input').forEach(inp => {
+    items.push({
+      account_id: parseInt(inp.dataset.acc),
+      balance: parseFloat(inp.value) || 0
+    });
+  });
+  await fetch('/api/balances', {
+    method: 'PUT',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ year: curYear, month: curMonth, balances: items })
+  });
+  document.getElementById('saveMsg').textContent = '✓ 已保存';
+  setTimeout(() => { document.getElementById('saveMsg').textContent = ''; }, 2000);
+  loadAll();
+}
+
+async function loadIncomes() {
+  const r = await fetch(`/api/incomes?year=${curYear}&month=${curMonth}`);
+  incomes = await r.json();
+  const el = document.getElementById('incomeList');
+  if (incomes.length === 0) {
+    el.innerHTML = '<div style="color:var(--sumi-light);font-size:13px;">暂无收入记录</div>';
+  } else {
+    el.innerHTML = incomes.map(inc => {
+      const acc = accounts.find(a => a.id === inc.account_id);
+      return `<div style="display:flex;align-items:center;gap:12px;padding:6px 0;border-bottom:1px solid var(--border);">
+        <span style="width:80px;">${inc.source}</span>
+        <span style="font-weight:600;width:100px;">¥${inc.amount.toLocaleString()}</span>
+        <span style="color:var(--sumi-light);font-size:13px;">${acc ? acc.name : ''}</span>
+        <span style="color:var(--sumi-light);font-size:12px;flex:1;">${inc.notes}</span>
+        <button class="btn btn-danger btn-xs" onclick="deleteIncome(${inc.id})">✕</button>
+      </div>`;
+    }).join('');
+  }
+}
+
+async function addIncome() {
+  const source = document.getElementById('incSource').value.trim();
+  const amount = parseFloat(document.getElementById('incAmount').value);
+  const account_id = document.getElementById('incAccount').value || null;
+  const notes = document.getElementById('incNotes').value;
+  if (!source || isNaN(amount)) return toast('请填写来源和金额', 'err');
+  await fetch('/api/incomes', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ year: curYear, month: curMonth, source, amount, account_id: account_id ? parseInt(account_id) : null, notes })
+  });
+  document.getElementById('incSource').value = '';
+  document.getElementById('incAmount').value = '';
+  document.getElementById('incNotes').value = '';
+  loadAll();
+}
+
+async function deleteIncome(id) {
+  showConfirm('删除收入', '确定要删除这条收入记录吗？', async () => {
+    await fetch(`/api/incomes/${id}`, { method: 'DELETE' });
+    toast('已删除', 'ok');
+    loadAll();
+  });
+}
+
+async function loadSummary() {
+  const r = await fetch(`/api/stats/total?year=${curYear}&month=${curMonth}`);
+  const s = await r.json();
+  document.getElementById('sumPrev').textContent = '¥' + s.prev_total_cny.toLocaleString();
+  document.getElementById('sumIncome').textContent = '¥' + s.income_cny.toLocaleString();
+  document.getElementById('sumCurr').textContent = '¥' + s.total_cny.toLocaleString();
+  document.getElementById('sumSpending').textContent = '¥' + s.spending_cny.toLocaleString();
+}
+
+// Account detail — uses shared function from base.html
+
+// Auto-save with debounce
+let _saveTimer = null;
+function scheduleAutoSave() {
+  clearTimeout(_saveTimer);
+  _saveTimer = setTimeout(async () => {
+    const items = [];
+    document.querySelectorAll('#balanceTable tbody input').forEach(inp => {
+      items.push({ account_id: parseInt(inp.dataset.acc), balance: parseFloat(inp.value) || 0 });
+    });
+    if (items.length === 0) return;
+    await fetch('/api/balances', {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ year: curYear, month: curMonth, balances: items })
+    });
+    toast('已自动保存', 'ok');
+  }, 2000);
+}
+
+// Trend chart
+let trendChart = null;
+async function loadTrend() {
+  const r = await fetch('/api/stats/trend?months=12');
+  const data = await r.json();
+  const labels = data.map(d => `${d.year}-${String(d.month).padStart(2,'0')}`);
+  const assets = data.map(d => d.total_cny);
+  const spendings = data.map(d => d.spending_cny);
+
+  const ctx = document.getElementById('trendChart').getContext('2d');
+  if (trendChart) trendChart.destroy();
+  trendChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [
+        { label: '总资产 (¥)', data: assets, borderColor: '#4A7CF6', backgroundColor: 'rgba(74,124,246,0.05)', fill: true, tension: 0.3, yAxisID: 'y' },
+        { label: '月花费 (¥)', data: spendings, borderColor: '#EF4444', backgroundColor: 'rgba(239,68,68,0.05)', fill: true, tension: 0.3, yAxisID: 'y1' },
+      ]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      interaction: { intersect: false, mode: 'index' },
+      scales: {
+        y: { type: 'linear', position: 'left', title: { display: true, text: '总资产 (¥)' }, ticks: { callback: v => '¥' + (v/10000).toFixed(1) + '万' } },
+        y1: { type: 'linear', position: 'right', title: { display: true, text: '月花费 (¥)' }, grid: { drawOnChartArea: false }, ticks: { callback: v => '¥'+v.toLocaleString() } },
+      },
+    }
+  });
+}
+
+async function loadAll() {
+  await loadAccounts();
+  await loadBalances();
+  await loadIncomes();
+  await loadSummary();
+  await loadTrend();
+}
+
+loadAll();
+</script>
+
+{% endblock %}

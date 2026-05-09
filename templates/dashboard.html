@@ -1,0 +1,150 @@
+{% extends "base.html" %}
+{% block content %}
+
+<!-- Big total -->
+<div class="card" style="text-align:center;">
+  <div style="font-size:14px;color:var(--sumi-light);margin-bottom:4px;">当前总资产</div>
+  <div class="total-highlight" id="dashTotal">—</div>
+  <div style="font-size:13px;color:var(--sumi-light);" id="dashDate"></div>
+</div>
+
+<!-- Summary cards -->
+<div class="summary-grid" id="dashCards"></div>
+
+<!-- Charts row -->
+<div class="card">
+  <div class="card-header">近12月趋势</div>
+  <div class="chart-wrap"><canvas id="dashTrend"></canvas></div>
+</div>
+
+<div class="card">
+  <div class="card-header">外币持仓</div>
+  <table>
+    <thead><tr><th>币种</th><th>金额</th><th>汇率 (→ CNY)</th><th>折合 CNY</th></tr></thead>
+    <tbody id="dashFx"></tbody>
+  </table>
+  <div style="margin-top:8px;">
+    <button class="btn btn-secondary btn-sm" onclick="refreshRates()">刷新汇率</button>
+    <span id="rateMsg" style="margin-left:8px;font-size:12px;color:var(--sumi-light);"></span>
+  </div>
+</div>
+
+<script>
+async function init() {
+  const now = new Date();
+  document.getElementById('dashDate').textContent = `${now.getFullYear()}年${now.getMonth()+1}月`;
+
+  await loadTotal();
+  await loadCards();
+  await loadTrend();
+  await loadFxRates();
+}
+
+async function loadTotal() {
+  const now = new Date();
+  const r = await fetch(`/api/stats/total?year=${now.getFullYear()}&month=${now.getMonth()+1}`);
+  const s = await r.json();
+  document.getElementById('dashTotal').textContent = '¥' + s.total_cny.toLocaleString();
+}
+
+async function loadCards() {
+  const now = new Date();
+  const br = await fetch(`/api/balances?year=${now.getFullYear()}&month=${now.getMonth()+1}`);
+  const bd = await br.json();
+
+  let liquid = 0, invest = 0, credit = 0;
+  bd.items.forEach(it => {
+    const cny = it.balance_cny || 0;
+    if (it.type === 'investment') invest += cny;
+    else if (it.type === 'credit' || it.type === 'loan') credit += cny;
+    else liquid += cny;
+  });
+
+  document.getElementById('dashCards').innerHTML = `
+    <div class="summary-card"><div class="label">流动资金</div><div class="value">¥${liquid.toLocaleString()}</div><div>银行 + 支付</div></div>
+    <div class="summary-card"><div class="label">投资资产</div><div class="value">¥${invest.toLocaleString()}</div><div>投资账户</div></div>
+    <div class="summary-card"><div class="label">负债</div><div class="value negative">¥${Math.abs(credit).toLocaleString()}</div><div>信用卡 + 贷款</div></div>
+    <div class="summary-card"><div class="label">净资产</div><div class="value">¥${(liquid + invest - Math.abs(credit)).toLocaleString()}</div><div>流动资金 + 投资 - 负债</div></div>
+  `;
+}
+
+// Trend chart
+let trendChart = null;
+async function loadTrend() {
+  const r = await fetch('/api/stats/trend?months=12');
+  const data = await r.json();
+  const labels = data.map(d => `${d.year}-${String(d.month).padStart(2,'0')}`);
+  const assets = data.map(d => d.total_cny);
+  const spendings = data.map(d => d.spending_cny);
+
+  const ctx = document.getElementById('dashTrend').getContext('2d');
+  if (trendChart) trendChart.destroy();
+  trendChart = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [
+        { label: '月花费 (¥)', data: spendings, backgroundColor: 'rgba(239,68,68,0.6)', yAxisID: 'y1' },
+        { label: '总资产 (¥)', data: assets, type: 'line', borderColor: '#4A7CF6', backgroundColor: 'rgba(74,124,246,0.05)', fill: true, tension: 0.3, yAxisID: 'y' },
+      ]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      interaction: { intersect: false, mode: 'index' },
+      scales: {
+        y: { type: 'linear', position: 'left', title: { display: true, text: '总资产 (¥)' }, ticks: { callback: v => '¥' + (v/10000).toFixed(1) + '万' } },
+        y1: { type: 'linear', position: 'right', title: { display: true, text: '花费 (¥)' }, grid: { drawOnChartArea: false }, ticks: { callback: v => '¥'+v.toLocaleString() } },
+      },
+    }
+  });
+}
+
+async function loadFxRates() {
+  const rr = await fetch('/api/exchange-rates');
+  const rates = await rr.json();
+
+  // Aggregate foreign currency balances from this month
+  const now = new Date();
+  const br = await fetch(`/api/balances?year=${now.getFullYear()}&month=${now.getMonth()+1}`);
+  const bd = await br.json();
+
+  const fxMap = {};
+  bd.items.forEach(it => {
+    if (it.currency === 'CNY') return;
+    if (!fxMap[it.currency]) fxMap[it.currency] = { balance: 0, rate: 1, cny: 0 };
+    fxMap[it.currency].balance += it.balance;
+  });
+
+  // Match rates
+  rates.forEach(r => {
+    if (fxMap[r.from_currency]) {
+      fxMap[r.from_currency].rate = r.rate;
+      fxMap[r.from_currency].cny = fxMap[r.from_currency].balance * r.rate;
+      fxMap[r.from_currency].fetched = r.fetched_at;
+    }
+  });
+
+  document.getElementById('dashFx').innerHTML = Object.entries(fxMap).map(([cur, val]) => `
+    <tr>
+      <td style="font-weight:600;">${cur}</td>
+      <td style="">${val.balance.toLocaleString()}</td>
+      <td style="color:var(--sumi-light);">1 ${cur} = ${val.rate} CNY</td>
+      <td style="font-weight:500;">¥${val.cny.toLocaleString()}</td>
+    </tr>
+  `).join('') || '<tr><td colspan="4" style="color:var(--sumi-light);">暂无外币持仓</td></tr>';
+}
+
+async function refreshRates() {
+  document.getElementById('rateMsg').textContent = '刷新中...';
+  await fetch('/api/exchange-rates/refresh', { method: 'POST' });
+  document.getElementById('rateMsg').textContent = '✓ 已刷新';
+  setTimeout(() => { document.getElementById('rateMsg').textContent = ''; }, 2000);
+  loadFxRates();
+  loadTotal();
+  loadCards();
+}
+
+init();
+</script>
+
+{% endblock %}

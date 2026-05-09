@@ -1,0 +1,143 @@
+{% extends "base.html" %}
+{% block content %}
+
+<div class="card">
+  <div class="card-header">添加账户</div>
+  <div id="currencyFields">
+    <div style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap;">
+      <div class="field"><label>账户名</label><input id="accName" placeholder="工行储蓄卡" style="width:150px;"></div>
+      <div class="field"><label>类型</label>
+        <select id="accType" style="width:110px;">
+          <option value="bank">银行储蓄</option>
+          <option value="ewallet">电子钱包</option>
+          <option value="credit">信用卡</option>
+          <option value="loan">贷款</option>
+          <option value="topup">充值账户</option>
+          <option value="investment">投资账户</option>
+        </select>
+      </div>
+      <div class="field"><label>币种</label>
+        <div style="display:flex;gap:4px;align-items:center;"><input class="acc-currency" value="CNY" placeholder="CNY" style="width:60px;"><button class="btn btn-secondary" onclick="addCurrencyRow()" title="添加币种" style="height:22px;width:22px;padding:0;font-size:14px;">+</button></div>
+      </div>
+      <button class="btn btn-primary btn-sm" onclick="addAccount()">添加</button>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-header">账户列表</div>
+  <table style="table-layout:fixed;">
+    <thead><tr>
+      <th style="width:18%;">名称</th><th style="width:14%;">类型</th><th style="width:16%;">币种</th><th style="width:10%;">状态</th><th style="width:26%;">操作</th>
+    </tr></thead>
+    <tbody id="accList"></tbody>
+  </table>
+</div>
+
+<script>
+function addCurrencyRow() {
+  const div = document.createElement('div');
+  div.style.cssText = 'display:flex;gap:12px;align-items:flex-end;margin-top:8px;';
+  div.innerHTML = `<div class="field" style="width:150px;"></div><div class="field" style="width:110px;"></div>
+    <div class="field"><div style="display:flex;gap:4px;align-items:center;"><input class="acc-currency" placeholder="CNY" style="width:60px;"><button class="btn btn-danger" onclick="this.closest('div').parentElement.remove()" style="height:22px;width:22px;padding:0;font-size:14px;">×</button></div></div>`;
+  document.getElementById('currencyFields').appendChild(div);
+}
+
+async function loadAccounts() {
+  const r = await fetch('/api/accounts'); const data = await r.json();
+  document.getElementById('accList').innerHTML = data.map(a => {
+    if (window._editing === a.id) {
+      return `<tr>
+        <td><input id="editName" value="${a.name}" style="width:110px;"></td>
+        <td><select id="editType" style="width:100px;">${Object.entries(typeLabels).map(([v,l]) => `<option value="${v}" ${a.type===v?'selected':''}>${l}</option>`).join('')}</select></td>
+        <td>${a.multi ? '<span class="badge badge-blue">多币种</span>' : a.currency}</td>
+        <td>${a.is_active ? '<span class="badge badge-green">在用</span>' : '<span class="badge badge-gray">停用</span>'}</td>
+        <td><button class="btn btn-primary btn-xs" onclick="saveEdit(${a.id})">💾 保存</button>
+            <button class="btn btn-secondary btn-xs" onclick="cancelEdit()">取消</button></td>
+      </tr>`;
+    }
+    const toggleBtn = a.is_active
+      ? `<button class="btn btn-xs" style="color:var(--kuchiba);" onclick="toggleAccount(${a.id},0,'${a.name}')">停用</button>`
+      : `<button class="btn btn-xs" style="color:var(--matcha);" onclick="toggleAccount(${a.id},1,'${a.name}')">启用</button>`;
+    const statusBadge = a.is_active
+      ? '<span class="badge badge-green">在用</span>'
+      : '<span class="badge badge-gray">停用</span>';
+    let currencyDisplay = a.currency;
+    if (a.multi && a.currencies) {
+      currencyDisplay = '<span class="badge badge-blue">多币种</span> ' + a.currencies.map(c => `<span style="font-size:11px;color:var(--sumi-light);">${c.currency}</span>`).join(' ');
+    }
+    return `<tr>
+      <td style="font-weight:500; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
+        <span class="account-link" onclick="showAccountDetail(${a.id})">${a.name}</span>
+      </td>
+      <td><span class="badge ${typeColors[a.type] || 'badge-gray'}">${typeLabels[a.type] || a.type}</span></td>
+      <td style="font-size:12px;">${currencyDisplay}</td>
+      <td>${statusBadge}</td>
+      <td>
+        <button class="btn btn-secondary btn-xs" onclick="startEdit(${a.id})">✎ 编辑</button>
+        ${toggleBtn}
+        <button class="btn btn-danger btn-xs" onclick="deleteAccount(${a.id}, '${a.name}')">🗑 删除</button>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+function startEdit(id) { window._editing = id; loadAccounts(); }
+function cancelEdit() { window._editing = null; loadAccounts(); }
+
+async function saveEdit(id) {
+  const name = document.getElementById('editName').value.trim();
+  const type = document.getElementById('editType').value;
+  if (!name) return toast('请输入账户名', 'err');
+  await fetch(`/api/accounts/${id}`, {
+    method: 'PUT',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ name, type })
+  });
+  window._editing = null;
+  loadAccounts();
+}
+
+async function addAccount() {
+  const name = document.getElementById('accName').value.trim();
+  const type = document.getElementById('accType').value;
+  const currencies = [...document.querySelectorAll('.acc-currency')].map(el => el.value.trim().toUpperCase()).filter(c => c);
+  if (!name) return toast('请输入账户名', 'err');
+  if (currencies.length === 0) return toast('至少需要一个币种', 'err');
+  await fetch('/api/accounts', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ name, type, currency: currencies[0], currencies, sort_order: 0 })
+  });
+  document.getElementById('accName').value = '';
+  // Reset currency fields to just one
+  document.getElementById('currencyFields').querySelectorAll('.form-grid:not(:first-child)').forEach(el => el.remove());
+  document.querySelector('.acc-currency').value = 'CNY';
+  loadAccounts();
+}
+
+async function toggleAccount(id, active, name) {
+  const action = active ? '启用' : '停用';
+  showConfirm(`${action}账户`, `确定要${action}「${name}」吗？`, async () => {
+    await fetch(`/api/accounts/${id}`, {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ is_active: active })
+    });
+    loadAccounts();
+    toast(`已${action}`, 'ok');
+  });
+}
+
+function deleteAccount(id, name) {
+  showConfirm('删除账户', `确定要删除「${name}」吗？如有余额记录则仅停用。`, async () => {
+    await fetch(`/api/accounts/${id}`, { method: 'DELETE' });
+    loadAccounts();
+    toast('已删除', 'ok');
+  });
+}
+
+loadAccounts();
+</script>
+
+{% endblock %}

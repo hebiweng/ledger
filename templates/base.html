@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>个人账本</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700&family=Newsreader:opsz,wght@16..72,400;16..72,500;16..72,600;16..72,700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+</head>
+<body>
+  <nav>
+    <span class="brand">📒 账本</span>
+    <a href="/" class="{{ 'active' if nav == 'index' else '' }}">余额总览</a>
+    <a href="/expenses" class="{{ 'active' if nav == 'expenses' else '' }}">消费记录</a>
+    <a href="/investment" class="{{ 'active' if nav == 'investment' else '' }}">投资记录</a>
+    <a href="/backtest" class="{{ 'active' if nav == 'backtest' else '' }}">回测</a>
+    <a href="/dashboard" class="{{ 'active' if nav == 'dashboard' else '' }}">总览</a>
+    <a href="/accounts" class="{{ 'active' if nav == 'accounts' else '' }}">账户管理</a>
+  </nav>
+  <div id="toast" class="toast" style="display:none;"></div>
+  <div class="container">
+    {% block content %}{% endblock %}
+  </div>
+
+  <!-- Shared confirm modal -->
+  <div id="sharedConfirm" class="overlay" style="display:none;">
+    <div class="panel panel-narrow">
+      <h3 id="confirmTitle">确认</h3>
+      <p id="confirmMsg"></p>
+      <div class="confirm-actions">
+        <button class="btn btn-secondary btn-sm" onclick="closeConfirm()">取消</button>
+        <button class="btn btn-danger btn-sm" id="confirmOk">确认</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Shared account detail panel -->
+  <div id="detailPanel" class="overlay" style="display:none;">
+    <div class="panel panel-wide" id="detailContent"></div>
+  </div>
+
+  <script>
+  function toast(msg, type) {
+    const el = document.getElementById('toast');
+    const colors = { ok: '#3B7D4A', err: '#C04540', warn: '#C2783A', info: '#3B5CCC' };
+    el.textContent = msg;
+    el.style.display = 'block';
+    el.style.background = colors[type] || colors.info;
+    el.style.color = '#fff';
+    clearTimeout(el._timer);
+    el._timer = setTimeout(function() { el.style.display = 'none'; }, 3200);
+  }
+  let _confirmCb = null;
+  function showConfirm(title, msg, cb) {
+    document.getElementById('confirmTitle').textContent = title;
+    document.getElementById('confirmMsg').innerHTML = msg;
+    document.getElementById('sharedConfirm').style.display = 'flex';
+    _confirmCb = cb;
+  }
+  function closeConfirm() { document.getElementById('sharedConfirm').style.display = 'none'; _confirmCb = null; }
+  document.getElementById('confirmOk').onclick = function() { if (_confirmCb) _confirmCb(); closeConfirm(); };
+
+  // Shared account detail panel
+  window._detailAccId = null;
+  const typeLabels = { bank: '银行储蓄', ewallet: '电子钱包', credit: '信用卡', topup: '充值账户', investment: '投资账户', loan: '贷款' };
+  const typeColors = { bank: 'badge-blue', ewallet: 'badge-green', credit: 'badge-red', topup: 'badge-gray', investment: 'badge-gray', loan: 'badge-red' };
+
+  async function showAccountDetail(accId) {
+    window._detailAccId = accId;
+    const panel = document.getElementById('detailPanel');
+    const content = document.getElementById('detailContent');
+    content.innerHTML = '<p style="text-align:center;padding:20px;">加载中…</p>';
+    panel.style.display = 'flex';
+
+    const r = await fetch(`/api/accounts/${accId}/records`);
+    const data = await r.json();
+    const a = data.account;
+
+    let html = `<h3>${a.name} <span class="badge ${typeColors[a.type] || 'badge-gray'}">${typeLabels[a.type] || a.type}</span> <span style="font-size:12px;color:var(--sumi-light);">${a.currency === 'MULTI' ? '多币种' : a.currency} · ${a.is_active ? '在用' : '已停用'}</span></h3>`;
+
+    // Per-currency breakdown for multi-currency accounts
+    if (data.subs && data.subs.length > 0) {
+      html += `<div class="summary-grid" style="margin-bottom:12px;">`;
+      data.subs.forEach(s => {
+        html += `<div class="summary-card">
+          <div class="label">${s.currency}</div>
+          <div class="value" style="font-size:20px;">${s.balance.toLocaleString()}</div>
+          <div>${s.balance_cny != null ? '¥' + s.balance_cny.toLocaleString() : '—'}</div>
+        </div>`;
+      });
+      html += `<div class="summary-card" style="border:1px solid var(--indigo);">
+        <div class="label">合计 CNY</div>
+        <div class="value positive" style="font-size:22px;">¥${(data.total_cny || 0).toLocaleString()}</div>
+      </div></div>`;
+    }
+
+    let hasAny = false;
+    const MAX = 10;
+
+    function section(title, rows, rowFn, type) {
+      if (!rows || rows.length === 0) return '';
+      hasAny = true;
+      const shown = rows.slice(0, MAX);
+      const more = rows.length > MAX ? ` <a href="/account/${accId}/records" style="font-size:11px;font-weight:400;">查看全部 (${rows.length}) →</a>` : '';
+      let h = `<div class="section-title">${title} (${rows.length})${more}</div>`;
+      h += '<table><thead><tr>';
+      rowFn.header().forEach(th => { h += `<th>${th}</th>`; });
+      h += '<th style="width:40px;"></th></tr></thead><tbody>';
+      shown.forEach(r => {
+        h += '<tr>';
+        rowFn.cells(r).forEach(c => { h += `<td>${c}</td>`; });
+        h += `<td><button class="btn btn-danger btn-xs" onclick="event.stopPropagation();delDetailRecord('${type}',${r.id})">×</button></td>`;
+        h += '</tr>';
+      });
+      h += '</tbody></table>';
+      return h;
+    }
+
+    html += section('月度余额', data.balances, {
+      header: () => ['年份', '月份', '余额'],
+      cells: r => [r.year, `${r.month}月`, r.balance.toLocaleString()]
+    }, 'balance');
+
+    html += section('消费记录', data.expenses, {
+      header: () => ['时间', '分类', '金额', '描述'],
+      cells: r => [r.datetime, r.category, r.amount.toLocaleString(), r.description || '-']
+    }, 'expense');
+
+    html += section('投资记录', data.investments, {
+      header: () => ['日期', '类型', '标的', '金额', '币种'],
+      cells: r => [r.date, r.type, r.asset, r.amount.toLocaleString(), r.currency]
+    }, 'investment');
+
+    html += section('收入记录', data.incomes, {
+      header: () => ['年', '月', '来源', '金额'],
+      cells: r => [r.year, `${r.month}月`, r.source, r.amount.toLocaleString()]
+    }, 'income');
+
+    html += section('定投计划(投资账户)', data.dca_account, {
+      header: () => ['标的', '金额', '频率', '下次执行'],
+      cells: r => [r.asset, r.amount.toLocaleString(), r.frequency, r.next_date || '-']
+    }, 'dca');
+
+    html += section('定投计划(付款账户)', data.dca_payment, {
+      header: () => ['标的', '金额', '频率', '下次执行'],
+      cells: r => [r.asset, r.amount.toLocaleString(), r.frequency, r.next_date || '-']
+    }, 'dca');
+
+    html += section('周期性支出', data.recurring, {
+      header: () => ['描述', '金额', '分类', '开始'],
+      cells: r => [r.description, r.amount.toLocaleString(), r.category, r.start]
+    }, 'recurring');
+
+    if (!hasAny) {
+      html += '<p style="color:var(--sumi-light);text-align:center;padding:32px 0;">该账户暂无关联记录</p>';
+    } else {
+      html += `<div style="margin-top:20px;text-align:right;border-top:1px solid var(--border-light);padding-top:16px;">
+        <a href="/account/${accId}/records" class="btn btn-secondary btn-sm">查看全部记录</a>
+        <button class="btn btn-danger btn-sm" onclick="clearDetailAll(${accId})">清空全部数据</button>
+      </div>`;
+    }
+
+    html += `<div style="text-align:right;margin-top:12px;">
+      <button class="btn btn-secondary btn-sm" onclick="closeDetail()">关闭</button>
+    </div>`;
+
+    content.innerHTML = html;
+  }
+
+  function closeDetail() {
+    document.getElementById('detailPanel').style.display = 'none';
+  }
+
+  async function delDetailRecord(type, id) {
+    const labelMap = { balance:'余额', expense:'消费', investment:'投资', income:'收入', dca:'定投', recurring:'周期性支出' };
+    showConfirm('删除记录', `确定要删除这条${labelMap[type] || ''}记录吗？`, async () => {
+      const urlMap = {
+        balance: `/api/balances/${id}`,
+        expense: `/api/expenses/${id}`,
+        investment: `/api/investments/${id}`,
+        income: `/api/incomes/${id}`,
+        dca: `/api/dca-plans/${id}?hard=true`,
+        recurring: `/api/recurring/${id}?hard=true`,
+      };
+      await fetch(urlMap[type], { method: 'DELETE' });
+      toast('已删除', 'ok');
+      if (window._detailAccId) showAccountDetail(window._detailAccId);
+    });
+  }
+
+  async function clearDetailAll(accId) {
+    showConfirm('清空全部数据', '确定要删除该账户的<b>所有</b>关联记录吗？<br><br><b>此操作不可恢复！</b>', async () => {
+      await fetch(`/api/accounts/${accId}/records`, { method: 'DELETE' });
+      toast('已清空', 'ok');
+      closeDetail();
+      if (typeof loadAccounts === 'function') loadAccounts();
+      if (typeof loadAll === 'function') loadAll();
+    });
+  }
+
+  // Close panel on overlay click
+  document.getElementById('detailPanel').addEventListener('click', function(e) {
+    if (e.target === this) closeDetail();
+  });
+  </script>
+</body>
+</html>

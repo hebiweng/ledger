@@ -1,0 +1,164 @@
+{% extends "base.html" %}
+{% block content %}
+
+<div id="app"></div>
+
+<script>
+const accId = {{ acc_id }};
+let curYear = new Date().getFullYear();
+let curMonth = new Date().getMonth() + 1;
+let allData = null;
+
+const typeLabels = { bank: '银行储蓄', ewallet: '电子钱包', credit: '信用卡', topup: '充值账户', investment: '投资账户', loan: '贷款' };
+const typeColors = { bank: 'badge-blue', ewallet: 'badge-green', credit: 'badge-red', topup: 'badge-gray', investment: 'badge-gray', loan: 'badge-red' };
+
+async function load() {
+  const params = new URLSearchParams();
+  if (curYear) params.set('year', curYear);
+  if (curMonth) params.set('month', curMonth);
+  const r = await fetch(`/api/accounts/${accId}/records?${params}`);
+  allData = await r.json();
+  render();
+}
+
+function render() {
+  const d = allData;
+  const a = d.account;
+  const typeLabel = typeLabels[a.type] || a.type;
+  const statusLabel = a.is_active ? '在用' : '已停用';
+
+  let html = `<div class="card">
+    <div class="card-header" style="display:flex;justify-content:space-between;align-items:center;">
+      <span>${a.name} <span class="badge ${typeColors[a.type] || 'badge-gray'}">${typeLabel}</span> <span style="font-size:13px;color:var(--sumi-light);">${a.currency} · ${statusLabel}</span></span>
+      <a href="/accounts" class="btn btn-secondary btn-sm">← 返回账户管理</a>
+    </div>`;
+
+  // Year/month filter
+  const years = [];
+  for (let y = 2020; y <= new Date().getFullYear(); y++) years.push(y);
+  const months = Array.from({length:12}, (_,i) => i+1);
+  html += `<div style="display:flex;gap:8px;align-items:center;margin-bottom:16px;">
+    <span style="font-size:13px;color:var(--sumi-light);">筛选:</span>
+    <select id="filterYear" onchange="curYear=parseInt(this.value)||null;load();" style="width:auto;">
+      <option value="">全部年份</option>
+      ${years.map(y => `<option value="${y}" ${y===curYear?'selected':''}>${y}年</option>`).join('')}
+    </select>
+    <select id="filterMonth" onchange="curMonth=parseInt(this.value)||null;load();" style="width:auto;">
+      <option value="">全部月份</option>
+      ${months.map(m => `<option value="${m}" ${m===curMonth?'selected':''}>${m}月</option>`).join('')}
+    </select>
+    <button class="btn btn-secondary btn-xs" onclick="curYear=null;curMonth=null;load();document.getElementById('filterYear').value='';document.getElementById('filterMonth').value='';">清除筛选</button>
+  </div>`;
+
+  let hasAny = false;
+
+  function section(title, rows, rowFn, type) {
+    if (!rows || rows.length === 0) return '';
+    hasAny = true;
+    let h = `<div class="section-title">${title} (${rows.length})</div>`;
+    h += '<table><thead><tr>';
+    rowFn.header().forEach(th => { h += `<th>${th}</th>`; });
+    h += '<th style="width:40px;"></th></tr></thead><tbody>';
+    rows.forEach(r => {
+      h += '<tr>';
+      rowFn.cells(r).forEach(c => { h += `<td>${c}</td>`; });
+      h += `<td><button class="btn btn-danger btn-xs" onclick="delRecord('${type}',${r.id})">×</button></td>`;
+      h += '</tr>';
+    });
+    h += '</tbody></table>';
+    return h;
+  }
+
+  // Balances
+  html += section('月度余额', d.balances, {
+    header: () => ['年份', '月份', '余额'],
+    cells: r => [r.year, `${r.month}月`, r.balance.toLocaleString()]
+  }, 'balance');
+
+  // Expenses
+  html += section('消费记录', d.expenses, {
+    header: () => ['时间', '分类', '金额', '描述'],
+    cells: r => [r.datetime, r.category, r.amount.toLocaleString(), r.description || '-']
+  }, 'expense');
+
+  // Investments
+  html += section('投资记录', d.investments, {
+    header: () => ['日期', '类型', '标的', '数量', '单价', '金额', '币种'],
+    cells: r => [r.date, r.type, r.asset, r.qty != null ? r.qty : '-', r.price != null ? r.price : '-', r.amount.toLocaleString(), r.currency]
+  }, 'investment');
+
+  // Incomes
+  html += section('收入记录', d.incomes, {
+    header: () => ['年', '月', '来源', '金额'],
+    cells: r => [r.year, `${r.month}月`, r.source, r.amount.toLocaleString()]
+  }, 'income');
+
+  // DCA account
+  html += section('定投计划(投资账户)', d.dca_account, {
+    header: () => ['标的', '金额', '费用', '频率', '下次执行', '状态'],
+    cells: r => [r.asset, r.amount.toLocaleString(), r.fees, r.frequency, r.next_date || '-', r.is_active ? '生效' : '暂停']
+  }, 'dca');
+
+  // DCA payment
+  html += section('定投计划(付款账户)', d.dca_payment, {
+    header: () => ['标的', '金额', '费用', '频率', '下次执行', '状态'],
+    cells: r => [r.asset, r.amount.toLocaleString(), r.fees, r.frequency, r.next_date || '-', r.is_active ? '生效' : '暂停']
+  }, 'dca');
+
+  // Recurring
+  html += section('周期性支出', d.recurring, {
+    header: () => ['描述', '金额', '分类', '开始', '状态'],
+    cells: r => [r.description, r.amount.toLocaleString(), r.category, r.start, r.is_active ? '生效' : '暂停']
+  }, 'recurring');
+
+  if (!hasAny) {
+    html += '<p style="color:var(--sumi-light);text-align:center;padding:32px 0;">该账户暂无关联记录</p>';
+  } else {
+    html += `<div style="margin-top:20px;text-align:right;border-top:1px solid var(--border-light);padding-top:16px;">
+      <button class="btn btn-danger" onclick="clearAllRecords(${accId})">清空当前筛选的全部数据</button>
+    </div>`;
+  }
+
+  html += '</div>';
+  document.getElementById('app').innerHTML = html;
+}
+
+async function delRecord(type, id) {
+  showConfirm('删除记录', `确定要删除这条记录吗？`, async () => {
+    let url;
+    switch (type) {
+      case 'balance':    url = `/api/balances/${id}`; break;
+      case 'expense':    url = `/api/expenses/${id}`; break;
+      case 'investment': url = `/api/investments/${id}`; break;
+      case 'income':     url = `/api/incomes/${id}`; break;
+      case 'dca':        url = `/api/dca-plans/${id}?hard=true`; break;
+      case 'recurring':  url = `/api/recurring/${id}?hard=true`; break;
+    }
+    await fetch(url, { method: 'DELETE' });
+    toast('已删除', 'ok');
+    load();
+  });
+}
+
+async function clearAllRecords(id) {
+  showConfirm('清空数据', '确定要删除该账户当前筛选条件下的所有关联记录吗？<br><br><b>此操作不可恢复！</b>', async () => {
+    // Delete individual records based on current filter
+    const d = allData;
+    const dels = [];
+    d.balances.forEach(r => dels.push(fetch(`/api/balances/${r.id}`, {method:'DELETE'})));
+    d.expenses.forEach(r => dels.push(fetch(`/api/expenses/${r.id}`, {method:'DELETE'})));
+    d.investments.forEach(r => dels.push(fetch(`/api/investments/${r.id}`, {method:'DELETE'})));
+    d.incomes.forEach(r => dels.push(fetch(`/api/incomes/${r.id}`, {method:'DELETE'})));
+    d.dca_account.forEach(r => dels.push(fetch(`/api/dca-plans/${r.id}?hard=true`, {method:'DELETE'})));
+    d.dca_payment.forEach(r => dels.push(fetch(`/api/dca-plans/${r.id}?hard=true`, {method:'DELETE'})));
+    d.recurring.forEach(r => dels.push(fetch(`/api/recurring/${r.id}?hard=true`, {method:'DELETE'})));
+    await Promise.all(dels);
+    toast('已清空', 'ok');
+    load();
+  });
+}
+
+load();
+</script>
+
+{% endblock %}

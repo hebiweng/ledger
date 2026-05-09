@@ -1,0 +1,17 @@
+# Personal data
+ledger.db
+
+# AI assistant config (personal)
+.comm/
+
+# Dev screenshots
+screenshots/
+
+# Python
+__pycache__/
+*.pyc
+
+# Temp / test files
+cache_spy_*.csv
+cache_6376.csv
+image.png

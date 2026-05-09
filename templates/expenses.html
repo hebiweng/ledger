@@ -1,0 +1,286 @@
+﻿{% extends "base.html" %}
+{% block content %}
+
+<div class="month-picker">
+  <button class="arrow" onclick="changeMonth(-1)">◀</button>
+  <span class="label" id="monthLabel">—</span>
+  <button class="arrow" onclick="changeMonth(1)">▶</button>
+  <button class="btn btn-secondary btn-sm" onclick="goToToday()">本月</button>
+</div>
+<div style="display:flex; gap:10px; margin-bottom:20px;">
+  <select id="filterCategory" onchange="loadExpenses()"><option value="">全部分类</option></select>
+  <select id="filterAccount" onchange="loadExpenses()"><option value="">全部账户</option></select>
+</div>
+
+<!-- Add expense -->
+<div class="card">
+  <div class="card-header">记一笔</div>
+  <div class="form-grid">
+    <div class="field"><label>时间</label><div style="display:flex;gap:6px;"><input id="expDate" type="date" style="flex:1;"><input id="expTime" type="time" style="flex:1;"></div></div>
+    <div class="field"><label>账户</label><select id="expAccount"><option value="">—</option></select></div>
+    <div class="field"><label>分类</label>
+      <input id="expCategory" list="catList" placeholder="选择或输入">
+      <datalist id="catList"></datalist>
+    </div>
+    <div class="field"><label>金额</label><input id="expAmount" type="number" step="0.01" placeholder="0.00"></div>
+    <div class="field"><label>描述</label><input id="expDesc" placeholder="买了什么..."></div>
+    <input type="hidden" id="expEditId" value=""><button class="btn btn-primary" id="expSaveBtn" onclick="saveExpense()" style="align-self:flex-end;">保存</button><button class="btn btn-secondary" id="expCancelBtn" style="display:none;align-self:flex-end;" onclick="cancelEditExp()">取消编辑</button>
+  </div>
+</div>
+
+<!-- Expenses list -->
+<div class="card">
+  <div class="card-header">消费记录</div>
+  <table>
+    <thead>
+      <tr><th style="width:125px;">时间</th><th>账户</th><th>分类</th><th>金额</th><th>描述</th><th></th></tr>
+    </thead>
+    <tbody id="expList"></tbody>
+  </table>
+  <div style="margin-top:12px; display:flex; gap:20px; font-size:14px;">
+    <span>消费合计: <strong id="expTotal">¥0</strong></span>
+    <span style="color:var(--sumi-light);">余额法推算: <strong id="expBalanceMethod">¥0</strong></span>
+    <span style="color:var(--sumi-light);">差额: <strong id="expDiff">¥0</strong></span>
+  </div>
+</div>
+
+<!-- Recurring expenses -->
+<div class="card">
+  <div class="card-header">周期性支出</div>
+  <div id="recurringList"></div>
+  <button class="btn btn-secondary btn-sm" style="margin-top:12px;" onclick="showRecurringForm()">+ 添加周期性支出</button>
+  <div id="recurringForm" style="display:none; margin-top:12px; padding:16px; background:var(--washi); border-radius:8px; border:1px solid var(--border);">
+    <div class="form-grid">
+      <div class="field"><label>描述</label><input id="recDesc" placeholder="房租 / iPhone分期"></div>
+      <div class="field"><label>分类</label><input id="recCategory" list="catList" placeholder="房租"></div>
+      <div class="field"><label>金额</label><input id="recAmount" type="number" step="0.01" placeholder="0.00"></div>
+      <div class="field"><label>付款账户</label><select id="recAccount"><option value="">—</option></select></div>
+      <div class="field"><label>开始年月</label><div style="display:flex;gap:4px;align-items:center;"><input id="recStartYear" type="number" placeholder="2026" style="width:70px;"><span>年</span><input id="recStartMonth" type="number" placeholder="1" style="width:50px;"><span>月</span></div></div>
+      <div class="field"><label>结束年月 <span style="color:var(--sumi-light);font-weight:400;">(空=持续)</span></label><div style="display:flex;gap:4px;align-items:center;"><input id="recEndYear" type="number" placeholder="2027" style="width:70px;"><span>年</span><input id="recEndMonth" type="number" placeholder="12" style="width:50px;"><span>月</span></div></div>
+    </div>
+    <div style="margin-top:10px; display:flex; gap:8px;">
+      <button class="btn btn-primary btn-sm" onclick="saveRecurring()">保存</button>
+      <button class="btn btn-secondary btn-sm" onclick="document.getElementById('recurringForm').style.display='none'">取消</button>
+    </div>
+  </div>
+</div>
+
+<!-- Pie chart -->
+<div class="card">
+  <div class="card-header">本月消费分类</div>
+  <div class="chart-wrap"><canvas id="pieChart"></canvas></div>
+</div>
+
+<script>
+const now = new Date();
+let curYear = now.getFullYear(), curMonth = now.getMonth() + 1;
+let accounts = [], categories = [], expenses = [];
+
+function fmtDate() { const d = new Date(); return d.toISOString().slice(0,10); }
+function fmtTime() { const d = new Date(); return `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`; }
+
+function goToToday() { curYear = now.getFullYear(); curMonth = now.getMonth() + 1; loadAll(); }
+function changeMonth(d) { curMonth += d; if (curMonth > 12) { curMonth = 1; curYear++; } if (curMonth < 1) { curMonth = 12; curYear--; } loadAll(); }
+
+async function init() {
+  document.getElementById('expDate').value = fmtDate();
+  document.getElementById('expTime').value = fmtTime();
+  document.getElementById('monthLabel').textContent = `${curYear} 年 ${curMonth} 月`;
+  const ar = await fetch('/api/accounts'); accounts = await ar.json();
+  let sel = document.getElementById('expAccount');
+  accounts.forEach(a => { sel.innerHTML += `<option value="${a.id}">${a.name}</option>`; });
+  sel = document.getElementById('recAccount');
+  accounts.forEach(a => { sel.innerHTML += `<option value="${a.id}">${a.name}</option>`; });
+  sel = document.getElementById('filterAccount');
+  accounts.forEach(a => { sel.innerHTML += `<option value="${a.id}">${a.name}</option>`; });
+
+  const cr = await fetch('/api/categories'); categories = await cr.json();
+  const dl = document.getElementById('catList');
+  const fc = document.getElementById('filterCategory');
+  categories.forEach(c => {
+    dl.innerHTML += `<option value="${c.name}">`;
+    fc.innerHTML += `<option value="${c.name}">${c.name}</option>`;
+  });
+  loadAll();
+}
+
+async function loadExpenses() {
+  const cat = document.getElementById('filterCategory').value;
+  const aid = document.getElementById('filterAccount').value;
+  let url = `/api/expenses?year=${curYear}&month=${curMonth}`;
+  if (cat) url += `&category=${encodeURIComponent(cat)}`;
+  if (aid) url += `&account_id=${aid}`;
+  const r = await fetch(url); expenses = await r.json();
+
+  let total = 0;
+  document.getElementById('expList').innerHTML = expenses.map(e => {
+    total += e.amount;
+    const acc = accounts.find(a => a.id === e.account_id);
+    const tag = e.recurring_id ? '<span class="tag">自动</span>' : '<span class="badge badge-gray">手动</span>';
+    return `<tr>
+      <td>${e.datetime}</td>
+      <td>${acc ? acc.name : ''}</td>
+      <td>${e.category}</td>
+      <td class="num-col" style="font-weight:500;">¥${e.amount.toLocaleString()}</td>
+      <td>${e.description}</td>
+      
+      <td><button class="btn btn-secondary btn-xs" onclick="editExpense(${e.id})">✎</button><button class="btn btn-danger btn-xs" onclick="deleteExpense(${e.id})">✕</button></td>
+    </tr>`;
+  }).join('');
+  document.getElementById('expTotal').textContent = '¥' + total.toLocaleString();
+
+  // Balance method comparison
+  const sr = await fetch(`/api/stats/total?year=${curYear}&month=${curMonth}`);
+  const s = await sr.json();
+  document.getElementById('expBalanceMethod').textContent = '¥' + s.spending_cny.toLocaleString();
+  const diff = s.spending_cny - total;
+  document.getElementById('expDiff').textContent = '¥' + Math.round(diff).toLocaleString();
+  document.getElementById('expDiff').style.color = Math.abs(diff) > 100 ? 'var(--kuchiba)' : 'var(--matcha)';
+}
+
+async function saveExpense() {
+  const editId = document.getElementById('expEditId').value;
+  const dateVal = document.getElementById('expDate').value;
+  const timeVal = document.getElementById('expTime').value;
+  const datetime = `${dateVal} ${timeVal}`;
+  if (!dateVal || !timeVal) return toast('请填写日期和时间', 'err');
+  const account_id = document.getElementById('expAccount').value || null;
+  const category = document.getElementById('expCategory').value.trim();
+  const amount = parseFloat(document.getElementById('expAmount').value);
+  const description = document.getElementById('expDesc').value;
+  if (!category || isNaN(amount)) return toast('请填写分类、金额', 'err');
+  const url = editId ? `/api/expenses/${editId}` : '/api/expenses';
+  const method = editId ? 'PUT' : 'POST';
+  const body = editId
+    ? { datetime, account_id: account_id ? parseInt(account_id) : null, category, amount, description }
+    : { datetime, account_id: account_id ? parseInt(account_id) : null, category, amount, description };
+  await fetch(url, { method, headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) });
+  resetExpForm();
+  loadAll();
+  toast(editId ? '已更新' : '已保存', 'ok');
+}
+
+async function editExpense(id) {
+  const e = expenses.find(x => x.id === id);
+  if (!e) return toast('记录不存在', 'err');
+  document.getElementById('expEditId').value = e.id;
+  const parts = e.datetime.split(' ');
+  document.getElementById('expDate').value = parts[0] || '';
+  document.getElementById('expTime').value = parts[1] || '';
+  document.getElementById('expAccount').value = e.account_id || '';
+  document.getElementById('expCategory').value = e.category;
+  document.getElementById('expAmount').value = e.amount;
+  document.getElementById('expDesc').value = e.description || '';
+  document.getElementById('expSaveBtn').textContent = '更新';
+  document.getElementById('expCancelBtn').style.display = '';
+}
+
+function cancelEditExp() { resetExpForm(); }
+
+function resetExpForm() {
+  document.getElementById('expEditId').value = '';
+  document.getElementById('expAmount').value = '';
+  document.getElementById('expDesc').value = '';
+  document.getElementById('expDate').value = fmtDate();
+  document.getElementById('expTime').value = fmtTime();
+  document.getElementById('expAccount').value = '';
+  document.getElementById('expCategory').value = '';
+  document.getElementById('expSaveBtn').textContent = '保存';
+  document.getElementById('expCancelBtn').style.display = 'none';
+}
+
+async function deleteExpense(id) {
+  showConfirm('删除消费记录', '确定要删除这条消费记录吗？', async () => {
+    await fetch(`/api/expenses/${id}`, { method: 'DELETE' });
+    toast('已删除', 'ok');
+    loadAll();
+  });
+}
+
+// Recurring
+async function loadRecurrings() {
+  const r = await fetch('/api/recurring'); const data = await r.json();
+  if (data.length === 0) {
+    document.getElementById('recurringList').innerHTML = '<div style="color:var(--sumi-light);font-size:13px;">暂无周期性支出</div>';
+    return;
+  }
+  document.getElementById('recurringList').innerHTML = `<table><thead><tr>
+    <th>描述</th><th>金额</th><th>分类</th><th>期间</th><th>状态</th><th></th>
+  </tr></thead><tbody>${data.map(r => {
+    const endLabel = r.end_year ? `${r.end_year}/${r.end_month}` : '持续';
+    return `<tr>
+      <td>${r.description}</td>
+      <td style="">¥${r.amount.toLocaleString()}</td>
+      <td>${r.category}</td>
+      <td style="font-size:13px;color:var(--sumi-light);">${r.start_year}/${r.start_month} ~ ${endLabel}</td>
+      <td>${r.is_active ? '<span class="badge badge-green">生效</span>' : '<span class="badge badge-gray">停用</span>'}</td>
+      <td><button class="btn btn-danger btn-xs" onclick="deleteRecurring(${r.id})">停用</button></td>
+    </tr>`;
+  }).join('')}</tbody></table>`;
+}
+
+function showRecurringForm() { document.getElementById('recurringForm').style.display = 'block'; }
+
+async function saveRecurring() {
+  const body = {
+    description: document.getElementById('recDesc').value,
+    amount: parseFloat(document.getElementById('recAmount').value),
+    category: document.getElementById('recCategory').value,
+    start_year: parseInt(document.getElementById('recStartYear').value),
+    start_month: parseInt(document.getElementById('recStartMonth').value),
+    payment_account: document.getElementById('recAccount').value ? parseInt(document.getElementById('recAccount').value) : null,
+    notes: document.getElementById('recNotes').value,
+  };
+  const ey = document.getElementById('recEndYear').value;
+  const em = document.getElementById('recEndMonth').value;
+  if (ey && em) { body.end_year = parseInt(ey); body.end_month = parseInt(em); }
+  if (!body.description || isNaN(body.amount) || !body.category || isNaN(body.start_year) || isNaN(body.start_month)) {
+    return toast('请填写必填字段', 'err');
+  }
+  await fetch('/api/recurring', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  });
+  document.getElementById('recurringForm').style.display = 'none';
+  loadRecurrings();
+}
+
+async function deleteRecurring(id) {
+  showConfirm('停用周期性支出', '确定要停用这条周期性支出吗？', async () => {
+    await fetch(`/api/recurring/${id}`, { method: 'DELETE' });
+    toast('已停用', 'ok');
+    loadRecurrings();
+  });
+}
+
+// Chart
+let pieChart = null;
+async function loadPie() {
+  const r = await fetch(`/api/stats/expense-breakdown?year=${curYear}&month=${curMonth}`);
+  const data = await r.json();
+  if (data.length === 0) return;
+  const ctx = document.getElementById('pieChart').getContext('2d');
+  if (pieChart) pieChart.destroy();
+  const colors = ['#4A7CF6','#10B981','#F59E0B','#EF4444','#8B5CF6','#EC4899','#06B6D4','#84CC16','#F97316','#6366F1'];
+  pieChart = new Chart(ctx, {
+    type: 'doughnut',
+    data: {
+      labels: data.map(d => d.category),
+      datasets: [{ data: data.map(d => d.amount), backgroundColor: colors.slice(0, data.length) }]
+    },
+    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'right' } } }
+  });
+}
+
+async function loadAll() {
+  document.getElementById('monthLabel').textContent = `${curYear} 年 ${curMonth} 月`;
+  await loadExpenses();
+  await loadRecurrings();
+  await loadPie();
+}
+
+init();
+</script>
+
+{% endblock %}
