@@ -479,7 +479,7 @@ def run_backtest(params):
             "symbol": symbol, "start": start, "end": end,
             "ath_reset": ath_reset,
             "rapid_rally": {"enabled": rapid_enabled, "days": rapid_days, "pct": rapid_pct},
-            "triggers": [{"drawdown_pct": t["drawdown_pct"], "buys_count": len(t.get("buys", []))} for t in triggers_sorted],
+            "triggers": [{"drawdown_pct": t["drawdown_pct"], "buys": [{"ticker": b.get("ticker","?"), "mode": b.get("mode","amount"), "value": b.get("value",0)} for b in t.get("buys",[])]} for t in triggers_sorted],
             "dca": dca_records,
         },
         "dates": dates_str,
