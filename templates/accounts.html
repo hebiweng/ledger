@@ -156,36 +156,50 @@ loadAccounts();
 
 <script>
 async function exportData() {
-  const a = document.createElement('a');
-  a.href = '/api/backup/export';
-  a.download = 'ledger_backup.json';
-  a.click();
-  toast('备份已下载', 'ok');
+  const pw = prompt('设置备份密码（至少4位）：');
+  if (!pw || pw.length < 4) return toast('密码至少4位', 'err');
+  const pw2 = prompt('再次输入密码确认：');
+  if (pw !== pw2) return toast('两次密码不一致', 'err');
+  try {
+    const r = await fetch('/api/backup/export', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({password: pw})
+    });
+    if (!r.ok) { const e = await r.json(); throw new Error(e.detail); }
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'ledger_backup.enc'; a.click();
+    URL.revokeObjectURL(url);
+    toast('加密备份已下载', 'ok');
+  } catch(e) {
+    toast('导出失败: ' + e.message, 'err');
+  }
 }
 
 async function importData(input) {
   const file = input.files[0];
   if (!file) return;
-  showConfirm('导入备份', `确定要导入 <b>${file.name}</b> 吗？<br><br>已存在的记录会跳过，不会覆盖。`, async () => {
-    try {
-      const text = await file.text();
-      const data = JSON.parse(text);
-      const r = await fetch('/api/backup/import', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify(data)
-      });
-      const result = await r.json();
-      let msg = [];
-      for (const [k, v] of Object.entries(result.imported)) {
-        msg.push(`${k}: +${v}`);
-      }
-      toast('导入完成: ' + msg.join(', '), 'ok');
-      loadAccounts();
-    } catch(e) {
-      toast('导入失败: ' + e.message, 'err');
+  const pw = prompt('输入备份密码：');
+  if (!pw) return;
+  const form = new FormData();
+  form.append('password', pw);
+  form.append('file', file);
+  try {
+    const r = await fetch('/api/backup/import/file', { method: 'POST', body: form });
+    if (!r.ok) { const e = await r.json(); throw new Error(e.detail); }
+    const result = await r.json();
+    let msg = [];
+    for (const [k, v] of Object.entries(result.imported)) {
+      msg.push(`${k}: +${v}`);
     }
-  });
+    if (result.errors && result.errors.length) msg.push('错误: ' + result.errors.join(', '));
+    toast('导入完成: ' + msg.join(', '), 'ok');
+    loadAccounts();
+  } catch(e) {
+    toast('导入失败: ' + e.message, 'err');
+  }
   input.value = '';
 }
 </script>

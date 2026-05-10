@@ -3,7 +3,7 @@ import json
 import os
 from datetime import datetime
 
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Form, UploadFile, File
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from jinja2 import Environment, FileSystemLoader
@@ -1453,10 +1453,42 @@ def api_backtest_report(data: dict):
 
 # ── Backup / Restore API ──────────────────────────────────
 
-@app.get("/api/backup/export")
-def api_backup_export(db: Session = Depends(get_db)):
-    """Export all user data as JSON."""
+def _derive_key(password: str, salt: bytes):
+    """Derive AES-256 key from password using PBKDF2."""
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=600000)
+    return kdf.derive(password.encode("utf-8"))
+
+
+def _encrypt_data(plaintext: str, password: str) -> bytes:
+    """Encrypt plaintext with AES-256-GCM. Returns salt + iv + tag + ciphertext."""
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    salt = os.urandom(16)
+    key = _derive_key(password, salt)
+    aesgcm = AESGCM(key)
+    nonce = os.urandom(12)
+    ct = aesgcm.encrypt(nonce, plaintext.encode("utf-8"), None)
+    return salt + nonce + ct
+
+
+def _decrypt_data(data: bytes, password: str) -> str:
+    """Decrypt AES-256-GCM ciphertext. Expects salt(16) + nonce(12) + ciphertext."""
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    salt, nonce, ct = data[:16], data[16:28], data[28:]
+    key = _derive_key(password, salt)
+    aesgcm = AESGCM(key)
+    return aesgcm.decrypt(nonce, ct, None).decode("utf-8")
+
+
+@app.post("/api/backup/export")
+def api_backup_export(data: dict, db: Session = Depends(get_db)):
+    """Export all user data as encrypted JSON."""
     from fastapi.responses import Response
+
+    password = data.get("password", "")
+    if len(password) < 4:
+        raise HTTPException(400, "密码至少4位")
 
     def row_to_dict(row):
         d = {}
@@ -1467,7 +1499,7 @@ def api_backup_export(db: Session = Depends(get_db)):
             d[col.name] = v
         return d
 
-    data = {
+    payload = {
         "version": 1,
         "exported_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "accounts": [row_to_dict(r) for r in db.query(Account).all()],
@@ -1480,16 +1512,29 @@ def api_backup_export(db: Session = Depends(get_db)):
         "exchange_rates": [row_to_dict(r) for r in db.query(ExchangeRate).all()],
         "dca_plans": [row_to_dict(r) for r in db.query(DcaPlan).all()],
     }
-    json_str = json.dumps(data, ensure_ascii=False, indent=2)
-    return Response(content=json_str, media_type="application/json",
-                    headers={"Content-Disposition": "attachment; filename=ledger_backup.json"})
+    encrypted = _encrypt_data(json.dumps(payload, ensure_ascii=False), password)
+    return Response(content=encrypted, media_type="application/octet-stream",
+                    headers={"Content-Disposition": "attachment; filename=ledger_backup.enc"})
 
 
 @app.post("/api/backup/import")
-def api_backup_import(data: dict, db: Session = Depends(get_db)):
-    """Import data from a backup JSON. Skips existing records by natural key."""
+def api_backup_import(request: dict, db: Session = Depends(get_db)):
+    """Import data from an encrypted backup. Merges: updates existing, inserts new."""
+    from fastapi import UploadFile, File, Form
+    raise HTTPException(400, "Use multipart form: password + file")
+
+
+@app.post("/api/backup/import/file")
+async def api_backup_import_file(password: str = Form(...), file: UploadFile = File(...), db: Session = Depends(get_db)):
+    """Import data from encrypted backup file."""
+    raw = await file.read()
+    try:
+        plain = _decrypt_data(raw, password)
+    except Exception:
+        raise HTTPException(400, "密码错误或文件损坏")
+
+    data = json.loads(plain)
     imported = {}
-    skipped = {}
     errors = []
 
     def _import_rows(key, Model, unique_cols, fk_clear):
@@ -1497,7 +1542,6 @@ def api_backup_import(data: dict, db: Session = Depends(get_db)):
         count = 0
         cols = [c.name for c in Model.__table__.columns]
         for r in rows:
-            # Build filter for natural key (or ID)
             existing = None
             filters = []
             for uc in unique_cols:
@@ -1507,15 +1551,11 @@ def api_backup_import(data: dict, db: Session = Depends(get_db)):
                 existing = db.query(Model).filter(*filters).first()
             elif r.get("id"):
                 existing = db.query(Model).filter(Model.id == r["id"]).first()
-
-            # Clear foreign keys and id
             for fk in fk_clear:
                 r.pop(fk, None)
             row_id = r.pop("id", None)
-
             try:
                 if existing:
-                    # Update existing record
                     for k, v in r.items():
                         if k in cols and k != "id":
                             setattr(existing, k, v)
@@ -1540,7 +1580,7 @@ def api_backup_import(data: dict, db: Session = Depends(get_db)):
     _import_rows("exchange_rates", ExchangeRate, ["from_currency", "to_currency"], [])
     _import_rows("dca_plans", DcaPlan, [], [])
 
-    return {"ok": True, "imported": imported, "skipped": skipped, "errors": errors}
+    return {"ok": True, "imported": imported, "errors": errors}
 
 
 if __name__ == "__main__":

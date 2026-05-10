@@ -505,9 +505,9 @@ async function loadBalances() {
 }
 
 async function loadSummary() {
+  // Portfolio cards are managed by loadPortfolio; this loads supplemental investment stats
   const r = await fetch('/api/stats/investment');
-  const data = await r.json();
-  document.getElementById('sumValue').innerHTML = '¥' + (data.accounts || []).reduce((s,a) => s + (a.balance_cny||0), 0).toLocaleString();
+  // data available for future use: total_invested_cny, total_withdraw_cny, accounts
 }
 
 init();
