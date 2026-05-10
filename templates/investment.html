@@ -233,7 +233,7 @@ async function loadPortfolio(refresh) {
     });
     const labels = Object.keys(typeMap);
     const data = Object.values(typeMap);
-    const colors = { stock:'#5B9BD5', etf:'#6CA0D0', fund:'#7BC078', crypto:'#E06060', bond:'#9B7EC4', option:'#ED8C50', future:'#ED8C50', forex:'#E8B850', reit:'#58B8A8', index:'#A0A0A0', commodity:'#C08050', cash:'#7BC078', other:'#A0A0A0' };
+    const colors = { stock:'#4E79A7', etf:'#59A14F', fund:'#76B7B2', crypto:'#E15759', bond:'#B07AA1', option:'#F28E2B', future:'#F28E2B', forex:'#EDC948', reit:'#9C755F', index:'#BAB0AC', commodity:'#E15759', cash:'#59A14F', other:'#BAB0AC' };
     const typeNames = { stock:'股票', etf:'ETF', fund:'基金', crypto:'加密货币', bond:'债券', option:'期权', future:'期货', forex:'外汇', reit:'REITs', index:'指数', commodity:'商品', cash:'现金', other:'其他' };
 
     const ctx = document.getElementById('chartTypePie').getContext('2d');

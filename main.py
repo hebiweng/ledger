@@ -1144,13 +1144,25 @@ def api_portfolio_performance(db: Session = Depends(get_db)):
                     v += sh[i] * px
         port_val[i] = round(v, 2)
 
-    # Convert to cumulative return percentages
-    def _to_pct(arr):
-        if not arr or arr[0] == 0: return [0]*len(arr)
-        base = arr[0]
-        return [round((v / base - 1) * 100, 2) for v in arr]
+    # Cumulative return accounting for cash flows (cost basis)
+    cum_cost = 0.0
+    costs = [0.0] * len(df)
+    for r in rows:
+        if r.type == "buy":
+            cum_cost += r.total_amount + (r.fees or 0)
+        elif r.type == "sell":
+            cum_cost -= r.total_amount - (r.fees or 0)
+        try:
+            idx = dates.index(r.date)
+            costs[idx] = cum_cost
+        except ValueError:
+            pass
+    # Forward-fill costs
+    for i in range(1, len(costs)):
+        if costs[i] == 0:
+            costs[i] = costs[i-1]
 
-    port_pct = _to_pct(port_val)
+    port_pct = [round((port_val[i] / costs[i] - 1) * 100, 2) if costs[i] > 0 else 0 for i in range(len(port_val))]
     qqq_pct = []
     spy_pct = []
     if "QQQ" in closes and len(closes["QQQ"]) > 0:
