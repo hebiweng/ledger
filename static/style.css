@@ -278,6 +278,10 @@ input[type="date"], input[type="time"] { min-width: 130px; color-scheme: light; 
 .badge-red { background: var(--beni-subtle); color: var(--beni); }
 .badge-blue { background: var(--indigo-subtle); color: var(--indigo); }
 .badge-gray { background: var(--washi-hover); color: var(--sumi-light); }
+.badge-purple { background: #f0e6f6; color: #7b4fa0; }
+.badge-teal { background: #e0f2f1; color: #00796b; }
+.badge-orange { background: #fff3e0; color: #e65100; }
+.badge-pink { background: #fce4ec; color: #c2185b; }
 
 /* ── Summary cards ──────────────────────────────── */
 

@@ -307,6 +307,26 @@ def api_account_records(acc_id: int, year: int = None, month: int = None, db: Se
     return records
 
 
+def _investment_cash(acc_id: int, db):
+    """Compute cash balance for an investment account from transaction history."""
+    rows = db.query(InvestmentRecord).filter(InvestmentRecord.account_id == acc_id).all()
+    cash = 0.0
+    for r in rows:
+        amount = r.total_amount or 0
+        fees = r.fees or 0
+        if r.type == "deposit":
+            cash += amount
+        elif r.type == "withdraw":
+            cash -= amount
+        elif r.type == "buy":
+            cash -= (amount + fees)
+        elif r.type == "sell":
+            cash += (amount - fees)
+        elif r.type == "dividend":
+            cash += amount
+    return round(cash, 2)
+
+
 # ── Monthly Balance API ──────────────────────────────────────
 
 @app.get("/api/balances")
@@ -365,9 +385,11 @@ def api_balances(year: int, month: int, db: Session = Depends(get_db)):
             })
         else:
             cur = all_balances.get(a.id)
+            is_inv = a.type == "investment"
             balance = cur.balance if cur else prev_balances.get(a.id, 0.0)
+            has_record = cur is not None
             conv = convert_to_cny(balance, a.currency, db)
-            if conv["valid"] and conv["rate"] is not None:
+            if conv["valid"] and conv["rate"] is not None and not is_inv:
                 total_cny += conv["value"]
             result.append({
                 "account_id": a.id, "account_name": a.name,
@@ -376,8 +398,9 @@ def api_balances(year: int, month: int, db: Session = Depends(get_db)):
                 "balance_cny": round(conv["value"], 2) if conv["valid"] else None,
                 "rate": conv["rate"], "valid_currency": conv["valid"],
                 "prev_balance": prev_balances.get(a.id),
-                "has_record": cur is not None,
+                "has_record": has_record,
                 "multi": False,
+                "is_investment": is_inv,
             })
     return {"items": result, "total_cny": round(total_cny, 2), "year": year, "month": month}
 
@@ -940,10 +963,10 @@ def api_portfolio(refresh: bool = False, db: Session = Depends(get_db)):
             holdings[key] = {"asset_name": key, "asset_type": r.asset_type, "currency": r.currency, "quantity": 0, "total_cost": 0}
         if r.type == "buy":
             holdings[key]["quantity"] += (r.quantity or 0)
-            holdings[key]["total_cost"] += r.total_amount
+            holdings[key]["total_cost"] += r.total_amount + (r.fees or 0)
         elif r.type == "sell":
             holdings[key]["quantity"] -= (r.quantity or 0)
-            holdings[key]["total_cost"] -= r.total_amount
+            holdings[key]["total_cost"] -= r.total_amount - (r.fees or 0)
 
     # Load price cache
     cache = {} if refresh else _load_portfolio_cache()
@@ -1053,6 +1076,91 @@ def api_portfolio(refresh: bool = False, db: Session = Depends(get_db)):
     }
 
     return {"holdings": result, "summary": summary}
+
+
+@app.get("/api/portfolio/performance")
+def api_portfolio_performance(db: Session = Depends(get_db)):
+    """Return daily portfolio value + QQQ/SPY benchmarks since first transaction."""
+    from datetime import datetime as _dt, timedelta as _td
+    import yfinance as _yf
+    import pandas as _pd
+    import math as _math
+
+    rows = db.query(InvestmentRecord).order_by(InvestmentRecord.date).all()
+    if not rows:
+        return {"dates": [], "portfolio": [], "qqq": [], "spy": []}
+
+    # Find date range
+    start_date = min(r.date for r in rows)
+    end_date = _dt.now().strftime("%Y-%m-%d")
+
+    # Get closing prices for all assets + QQQ/SPY
+    tickers = set(r.asset_name for r in rows if r.type in ("buy", "sell"))
+    tickers.update(["QQQ", "SPY"])
+    closes = {}
+    for tkr in tickers:
+        try:
+            tk = _yf.Ticker(tkr)
+            hist = tk.history(start=start_date, end=end_date, auto_adjust=True)
+            if not hist.empty:
+                closes[tkr] = hist["Close"]
+        except Exception:
+            pass
+
+    if not closes:
+        return {"dates": [], "portfolio": [], "qqq": [], "spy": []}
+
+    # Build combined price index
+    df = _pd.DataFrame(closes).ffill()
+    dates = [d.strftime("%Y-%m-%d") for d in df.index]
+
+    # Compute daily portfolio value
+    port_val = [0.0] * len(df)
+    # For each buy/sell, accumulate shares at each point
+    ticker_shares = {t: [0.0] * len(df) for t in tickers if t not in ("QQQ", "SPY")}
+    for r in rows:
+        if r.type not in ("buy", "sell") or r.asset_name not in ticker_shares:
+            continue
+        tkr = r.asset_name
+        qty = r.quantity or 0
+        date_str = r.date
+        try:
+            idx = dates.index(date_str)
+        except ValueError:
+            continue
+        if r.type == "buy":
+            for i in range(idx, len(df)):
+                ticker_shares[tkr][i] += qty
+        elif r.type == "sell":
+            for i in range(idx, len(df)):
+                ticker_shares[tkr][i] -= qty
+
+    for i in range(len(df)):
+        v = 0.0
+        for tkr, sh in ticker_shares.items():
+            if tkr in closes and i < len(closes[tkr]):
+                px = float(closes[tkr].iloc[i])
+                if not _math.isnan(px):
+                    v += sh[i] * px
+        port_val[i] = round(v, 2)
+
+    # Convert to cumulative return percentages
+    def _to_pct(arr):
+        if not arr or arr[0] == 0: return [0]*len(arr)
+        base = arr[0]
+        return [round((v / base - 1) * 100, 2) for v in arr]
+
+    port_pct = _to_pct(port_val)
+    qqq_pct = []
+    spy_pct = []
+    if "QQQ" in closes and len(closes["QQQ"]) > 0:
+        qqq0 = float(closes["QQQ"].iloc[0])
+        qqq_pct = [round((float(closes["QQQ"].iloc[i]) / qqq0 - 1) * 100, 2) for i in range(len(df))]
+    if "SPY" in closes and len(closes["SPY"]) > 0:
+        spy0 = float(closes["SPY"].iloc[0])
+        spy_pct = [round((float(closes["SPY"].iloc[i]) / spy0 - 1) * 100, 2) for i in range(len(df))]
+
+    return {"dates": dates, "portfolio": port_pct, "qqq": qqq_pct, "spy": spy_pct}
 
 
 def _resolve_secid(symbol: str, asset_type: str = "stock") -> str | None:
@@ -1416,6 +1524,44 @@ def api_stats_investment(db: Session = Depends(get_db)):
         "total_dividend_cny": round(total_dividend, 2),
         "accounts": inv_balances,
     }
+
+
+# ── Transfer API ────────────────────────────────────────
+
+@app.post("/api/transfers")
+def api_transfer(data: dict, db: Session = Depends(get_db)):
+    """Transfer money between two accounts. Creates corresponding investment records."""
+    from_id = data.get("from_account_id")
+    to_id = data.get("to_account_id")
+    amount = float(data.get("amount", 0))
+    currency = data.get("currency", "CNY")
+    date_str = data.get("date", datetime.now().strftime("%Y-%m-%d"))
+    notes = data.get("notes", "")
+
+    if not from_id or not to_id:
+        raise HTTPException(400, "请选择转出和转入账户")
+    if amount <= 0:
+        raise HTTPException(400, "金额必须大于0")
+
+    from_acc = db.query(Account).filter(Account.id == from_id).first()
+    to_acc = db.query(Account).filter(Account.id == to_id).first()
+    if not from_acc or not to_acc:
+        raise HTTPException(400, "账户不存在")
+
+    # Create withdraw from source
+    db.add(InvestmentRecord(
+        date=date_str, type="withdraw", asset_name=f"转账至 {to_acc.name}",
+        asset_type="cash", total_amount=amount, currency=currency,
+        account_id=from_id, notes=notes,
+    ))
+    # Create deposit to target
+    db.add(InvestmentRecord(
+        date=date_str, type="deposit", asset_name=f"来自 {from_acc.name} 转账",
+        asset_type="cash", total_amount=amount, currency=currency,
+        account_id=to_id, notes=notes,
+    ))
+    db.commit()
+    return {"ok": True, "msg": f"已从「{from_acc.name}」转账 {amount} {currency} 到「{to_acc.name}」"}
 
 
 # ── Backtest API ────────────────────────────────────────

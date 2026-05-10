@@ -11,8 +11,10 @@ screenshots/
 __pycache__/
 *.pyc
 
-# Cache & output
-cache/
+# Cache: keep price data, exclude portfolio cache (has timestamps)
+cache/portfolio_prices.json
+
+# Output
 output/
 
 # Temp / test files

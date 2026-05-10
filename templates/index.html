@@ -115,15 +115,49 @@ async function loadBalances() {
   const data = await r.json();
   balances = {};
   data.items.forEach(it => { balances[it.account_id] = it; });
-  document.getElementById('totalCny').textContent = '¥' + data.total_cny.toLocaleString();
   document.getElementById('monthLabel').textContent = fmtMonth(curYear, curMonth);
-  renderBalanceTable(data.items);
+
+  // Fetch portfolio market value for investment accounts
+  let portfolioVal = 0;
+  try {
+    const pr = await fetch('/api/portfolio');
+    const pd = await pr.json();
+    portfolioVal = pd.summary?.total_value_cny || 0;
+  } catch(e) {}
+
+  const totalCny = data.total_cny + portfolioVal;
+  document.getElementById('totalCny').textContent = '¥' + totalCny.toLocaleString();
+  renderBalanceTable(data.items, portfolioVal);
 }
 
-function renderBalanceTable(items) {
+function renderBalanceTable(items, portfolioVal) {
   const tbody = document.querySelector('#balanceTable tbody');
+  const typeNames = { bank: '借记卡', credit: '信用卡', ewallet: '电子钱包', investment: '投资账户', topup: '充值账户', loan: '贷款', cash: '现金' };
   let html = '';
+  let lastType = null;
+  let subTotal = 0;
+  let subCount = 0;
+
+  function flushSubtotal() {
+    if (subCount > 1 && lastType) {
+      html += `<tr style="background:var(--washi-hover);font-weight:500;font-size:13px;">
+        <td>${typeNames[lastType] || lastType} 小计 (${subCount}个)</td>
+        <td></td><td style="color:var(--sumi-light);"></td>
+        <td style="font-weight:600;text-align:center;">¥${Math.round(subTotal).toLocaleString()}</td>
+        <td></td>
+      </tr>`;
+    }
+  }
+
   items.forEach(it => {
+    if (it.type !== lastType) {
+      flushSubtotal();
+      lastType = it.type;
+      subTotal = 0;
+      subCount = 0;
+    }
+    subTotal += (it.balance_cny || 0);
+    subCount++;
     const badges = { investment: '<span class="badge badge-blue">投资</span>', credit: '<span class="badge badge-red">信用</span>' };
     const badge = badges[it.type] || '';
 
@@ -162,6 +196,13 @@ function renderBalanceTable(items) {
       </tr>`;
     }
   });
+  flushSubtotal();  // last group
+  if (portfolioVal > 0) {
+    html += `<tr style="background:var(--indigo-subtle);">
+      <td colspan="4" style="font-weight:500;">📈 投资组合市值</td>
+      <td style="font-weight:600;font-size:14px;">¥${portfolioVal.toLocaleString()}</td>
+    </tr>`;
+  }
   tbody.innerHTML = html;
 }
 
