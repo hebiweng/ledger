@@ -37,7 +37,7 @@
   <div id="incomeList"></div>
   <div class="form-row" style="margin-top:12px;">
     <div class="field"><label>来源</label><input id="incSource" placeholder="工资"></div>
-    <div class="field"><label>金额</label><input id="incAmount" type="number" step="0.01"></div>
+    <div class="field"><label>金额</label><input id="incAmount" type="number" step="0.01" min="0.01"></div>
     <div class="field"><label>入账账户</label><select id="incAccount"><option value="">—</option></select></div>
     <div class="field"><label>备注</label><input id="incNotes" style="width:160px;"></div>
     <button class="btn btn-primary btn-sm" onclick="addIncome()" style="align-self:flex-end;">+ 添加</button>
@@ -142,7 +142,7 @@ function renderBalanceTable(items) {
           <td>${s.currency}</td>
           <td style="color:var(--sumi-light);">—</td>
           <td><input class="inline-edit" type="number" step="0.01" value="${s.balance}"
-                     data-acc="${s.sub_id}" data-curr="${s.currency}"
+                     data-acc="${s.sub_id}" data-curr="${s.currency}" style="text-align:center;"
                      oninput="onBalanceChange();scheduleAutoSave()"></td>
           <td style="font-weight:500;font-size:13px;">${s.balance_cny != null ? '¥'+s.balance_cny.toLocaleString() : '—'}</td>
         </tr>`;
@@ -155,7 +155,8 @@ function renderBalanceTable(items) {
         <td>${it.currency}</td>
         <td style="color:var(--sumi-light);">¥${(it.prev_balance || 0).toLocaleString()}</td>
         <td><input class="inline-edit" type="number" step="0.01" value="${it.balance}"
-                   data-acc="${it.account_id}" data-curr="${it.currency}"
+                   data-acc="${it.account_id}" data-curr="${it.currency}" style="text-align:center;"
+                   ${it.type !== 'credit' && it.type !== 'loan' ? 'min="0"' : ''}
                    oninput="onBalanceChange();scheduleAutoSave()"></td>
         <td style="font-weight:500;">${cnyDisplay}</td>
       </tr>`;

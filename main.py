@@ -1,4 +1,6 @@
 """Personal ledger web app — FastAPI entry point."""
+import json
+import os
 from datetime import datetime
 
 from fastapi import FastAPI, Depends, HTTPException
@@ -104,7 +106,9 @@ def page_backtest():
 @app.get("/api/accounts")
 def api_accounts(db: Session = Depends(get_db)):
     """Return top-level accounts with merged sub-account info for multi-currency."""
-    accounts = db.query(Account).filter(Account.parent_id == None).order_by(Account.sort_order).all()
+    type_order = {"bank": 0, "credit": 1, "ewallet": 2, "investment": 3, "topup": 4, "loan": 5, "cash": 6}
+    accounts = db.query(Account).filter(Account.parent_id == None).all()
+    accounts.sort(key=lambda a: (type_order.get(a.type, 99), a.sort_order))
     result = []
     for a in accounts:
         subs = db.query(Account).filter(Account.parent_id == a.id).all()
@@ -308,9 +312,11 @@ def api_account_records(acc_id: int, year: int = None, month: int = None, db: Se
 @app.get("/api/balances")
 def api_balances(year: int, month: int, db: Session = Depends(get_db)):
     # Only top-level accounts (not sub-accounts)
+    type_order = {"bank": 0, "credit": 1, "ewallet": 2, "investment": 3, "topup": 4, "loan": 5, "cash": 6}
     accounts = db.query(Account).filter(
         Account.is_active == 1, Account.parent_id == None
-    ).order_by(Account.sort_order).all()
+    ).all()
+    accounts.sort(key=lambda a: (type_order.get(a.type, 99), a.sort_order))
 
     all_balances = {
         mb.account_id: mb
@@ -378,7 +384,12 @@ def api_balances(year: int, month: int, db: Session = Depends(get_db)):
 
 @app.put("/api/balances")
 def api_balances_save(data: MonthlyBalanceSave, db: Session = Depends(get_db)):
+    neg_ok = {"credit", "loan"}
     for entry in data.balances:
+        if entry.balance < 0:
+            acc = db.query(Account).filter(Account.id == entry.account_id).first()
+            if acc and acc.type not in neg_ok:
+                raise HTTPException(400, f"「{acc.name}」不支持负数余额")
         mb = db.query(MonthlyBalance).filter(
             MonthlyBalance.account_id == entry.account_id,
             MonthlyBalance.year == data.year,
@@ -834,11 +845,23 @@ def api_investments(
 
 @app.post("/api/investments")
 def api_investment_create(data: InvestmentCreate, db: Session = Depends(get_db)):
-    r = InvestmentRecord(**data.model_dump())
+    d = data.model_dump()
+    # Auto-fill missing quantity/price for buy/sell
+    if data.type in ("buy", "sell"):
+        qty = d.get("quantity")
+        price = d.get("price")
+        total = d["total_amount"]
+        if not qty and price and price > 0:
+            qty = round(total / price, 4)
+        elif not price and qty and qty > 0:
+            price = round(total / qty, 2)
+        d["quantity"] = qty
+        d["price"] = price
+    r = InvestmentRecord(**{k: v for k, v in d.items() if k in [c.name for c in InvestmentRecord.__table__.columns]})
     db.add(r)
     db.commit()
     db.refresh(r)
-    return {"id": r.id, "asset_name": r.asset_name, "type": r.type}
+    return {"id": r.id, "asset_name": r.asset_name, "type": r.type, "quantity": r.quantity, "price": r.price}
 
 
 @app.put("/api/investments/{inv_id}")
@@ -864,6 +887,48 @@ def api_investment_delete(inv_id: int, db: Session = Depends(get_db)):
 
 # ── Portfolio API ───────────────────────────────────────
 
+PORTFOLIO_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache", "portfolio_prices.json")
+
+def _is_market_open() -> bool:
+    """Return True if US market is currently open (Mon-Fri 9:30-16:00 ET)."""
+    from datetime import timezone, timedelta
+    now_utc = datetime.now(timezone.utc)
+    # US ET = UTC-5 (EST) or UTC-4 (EDT). Approximate: US market 14:30-21:00 UTC
+    et_offset = timedelta(hours=-4)  # EDT approximation
+    now_et = now_utc + et_offset
+    if now_et.weekday() >= 5:  # Sat/Sun
+        return False
+    market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+    market_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+    return market_open <= now_et <= market_close
+
+def _is_same_trading_day(ts: float) -> bool:
+    """Check if cached timestamp is from the same trading day."""
+    from datetime import timezone, timedelta
+    now = datetime.now()
+    cached_dt = datetime.fromtimestamp(ts)
+    # If within same calendar day and after market open, it's same trading day
+    if now.date() == cached_dt.date():
+        return True
+    # Handle weekends: Friday cache valid through Sunday
+    if cached_dt.weekday() == 4 and now.weekday() >= 5 and (now - cached_dt).days <= 2:
+        return True
+    return False
+
+def _load_portfolio_cache():
+    if os.path.exists(PORTFOLIO_CACHE_FILE):
+        try:
+            with open(PORTFOLIO_CACHE_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def _save_portfolio_cache(cache):
+    os.makedirs(os.path.dirname(PORTFOLIO_CACHE_FILE), exist_ok=True)
+    with open(PORTFOLIO_CACHE_FILE, "w") as f:
+        json.dump(cache, f)
+
 @app.get("/api/portfolio")
 def api_portfolio(refresh: bool = False, db: Session = Depends(get_db)):
     """Aggregated holdings by asset. Optionally fetches live prices."""
@@ -879,6 +944,10 @@ def api_portfolio(refresh: bool = False, db: Session = Depends(get_db)):
         elif r.type == "sell":
             holdings[key]["quantity"] -= (r.quantity or 0)
             holdings[key]["total_cost"] -= r.total_amount
+
+    # Load price cache
+    cache = {} if refresh else _load_portfolio_cache()
+    need_refresh = refresh
 
     result = []
     for h in holdings.values():
@@ -899,20 +968,43 @@ def api_portfolio(refresh: bool = False, db: Session = Depends(get_db)):
             "profit_pct": None,
             "change_pct": None,
         }
-        if refresh:
+        ticker = h["asset_name"]
+        cached = cache.get(ticker)
+        # Determine if we should fetch: refresh requested, no cache, or market open + stale cache
+        should_fetch = need_refresh or not cached
+        if not should_fetch and cached:
+            if _is_market_open() and not _is_same_trading_day(cached.get("ts", 0)):
+                should_fetch = True  # market open but cache is from previous session
+
+        if should_fetch:
             price, price_cny, name, change_pct = _fetch_price(
-                h["asset_name"], h["currency"], db, h["asset_type"]
+                ticker, h["currency"], db, h["asset_type"]
             )
             if price is not None:
-                item["display_name"] = name
-                item["current_price"] = price
-                item["current_value"] = round(h["quantity"] * price, 2)
-                item["profit"] = round(item["current_value"] - h["total_cost"], 2)
-                if h["total_cost"] > 0:
-                    item["profit_pct"] = round(item["profit"] / h["total_cost"] * 100, 2)
-                if change_pct is not None:
-                    item["change_pct"] = change_pct
+                cache[ticker] = {"ts": datetime.now().timestamp(), "price": price,
+                                 "name": name, "change_pct": change_pct}
+            elif cached:
+                price, name, change_pct = cached["price"], cached.get("name"), cached.get("change_pct")
+            else:
+                price = None
+        else:
+            price = cached["price"]
+            name = cached.get("name")
+            change_pct = cached.get("change_pct")
+
+        if price is not None:
+            item["display_name"] = name
+            item["current_price"] = price
+            item["current_value"] = round(h["quantity"] * price, 2)
+            item["profit"] = round(item["current_value"] - h["total_cost"], 2)
+            if h["total_cost"] > 0:
+                item["profit_pct"] = round(item["profit"] / h["total_cost"] * 100, 2)
+            if change_pct is not None:
+                item["change_pct"] = change_pct
         result.append(item)
+
+    if need_refresh:
+        _save_portfolio_cache(cache)
 
     # ── Portfolio summary (all values in CNY) ────────
     total_cost_cny = 0
@@ -938,6 +1030,17 @@ def api_portfolio(refresh: bool = False, db: Session = Depends(get_db)):
             if it["change_pct"] is not None:
                 daily_pnl_cny += val_cny * it["change_pct"] / 100
 
+    # Sum fees from buy/sell records, convert to CNY
+    total_fees_cny = 0.0
+    for r in rows:
+        if r.type in ("buy", "sell") and r.fees:
+            if r.currency == "CNY":
+                total_fees_cny += r.fees
+            else:
+                conv = convert_to_cny(r.fees, r.currency, db)
+                if conv["valid"] and conv["rate"] is not None:
+                    total_fees_cny += conv["value"]
+
     summary = {
         "total_cost_cny": round(total_cost_cny, 2),
         "total_value_cny": round(total_value_cny, 2),
@@ -946,6 +1049,7 @@ def api_portfolio(refresh: bool = False, db: Session = Depends(get_db)):
         "daily_change_cny": round(daily_pnl_cny, 2),
         "daily_change_pct": round(daily_pnl_cny / total_value_cny * 100, 2) if total_value_cny > 0 else 0,
         "holdings_count": len(result),
+        "total_fees_cny": round(total_fees_cny, 2),
     }
 
     return {"holdings": result, "summary": summary}
@@ -1157,6 +1261,33 @@ def _fetch_price(symbol: str, currency: str, db: Session, asset_type: str = "sto
             print(f"[portfolio] Price fetch failed for {sid}: {e}")
             continue
 
+    # ── Fallback: yfinance for non-Chinese tickers ──
+    if asset_type in ("stock", "etf") and not symbol.isdigit():
+        try:
+            import yfinance as _yf
+            from datetime import datetime as _dt, timedelta as _td
+            tk = _yf.Ticker(symbol)
+            end_dt = _dt.now()
+            start_dt = end_dt - _td(days=5)
+            hist = tk.history(start=start_dt, end=end_dt, auto_adjust=True)
+            if not hist.empty:
+                px = float(hist["Close"].iloc[-1])
+                try:
+                    info = _yf.Ticker(symbol).info
+                    name = info.get('longName') or info.get('shortName') or symbol
+                except Exception:
+                    name = symbol
+                prev = float(hist["Close"].iloc[-2]) if len(hist) > 1 else px
+                change = (px - prev) / prev if prev > 0 else 0
+                if currency.upper() != "CNY":
+                    cny_price = convert_to_cny(px, currency, db)["value"]
+                else:
+                    cny_price = px
+                print(f"[portfolio] yfinance:{symbol} = {px:.2f}  {change*100:+.2f}%")
+                return round(px, 2), round(cny_price, 2), name, round(change * 100, 2)
+        except Exception as e:
+            print(f"[portfolio] yfinance fallback failed for {symbol}: {e}")
+
     return None, None, None, None
 
 
@@ -1296,6 +1427,120 @@ def api_backtest_run(data: dict):
 
     result = run_backtest(data)
     return result
+
+
+@app.post("/api/backtest/report")
+def api_backtest_report(data: dict):
+    """Generate backtest PDF report."""
+    from backtest import run_backtest
+    from fastapi.responses import Response
+
+    result = run_backtest(data)
+    # import gen_pdf from output/
+    import importlib.util, sys
+    spec = importlib.util.spec_from_file_location(
+        "gen_pdf",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "output", "gen_pdf.py")
+    )
+    gen_pdf = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gen_pdf)
+
+    html = gen_pdf.build_html(result)
+    pdf_bytes = gen_pdf.html_to_pdf(html)
+    return Response(content=pdf_bytes, media_type="application/pdf",
+                    headers={"Content-Disposition": "attachment; filename=backtest_report.pdf"})
+
+
+# ── Backup / Restore API ──────────────────────────────────
+
+@app.get("/api/backup/export")
+def api_backup_export(db: Session = Depends(get_db)):
+    """Export all user data as JSON."""
+    from fastapi.responses import Response
+
+    def row_to_dict(row):
+        d = {}
+        for col in row.__table__.columns:
+            v = getattr(row, col.name)
+            if isinstance(v, datetime):
+                v = v.strftime("%Y-%m-%d %H:%M:%S")
+            d[col.name] = v
+        return d
+
+    data = {
+        "version": 1,
+        "exported_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "accounts": [row_to_dict(r) for r in db.query(Account).all()],
+        "monthly_balances": [row_to_dict(r) for r in db.query(MonthlyBalance).all()],
+        "income_records": [row_to_dict(r) for r in db.query(IncomeRecord).all()],
+        "expense_records": [row_to_dict(r) for r in db.query(ExpenseRecord).all()],
+        "expense_categories": [row_to_dict(r) for r in db.query(ExpenseCategory).all()],
+        "recurring_expenses": [row_to_dict(r) for r in db.query(RecurringExpense).all()],
+        "investment_records": [row_to_dict(r) for r in db.query(InvestmentRecord).all()],
+        "exchange_rates": [row_to_dict(r) for r in db.query(ExchangeRate).all()],
+        "dca_plans": [row_to_dict(r) for r in db.query(DcaPlan).all()],
+    }
+    json_str = json.dumps(data, ensure_ascii=False, indent=2)
+    return Response(content=json_str, media_type="application/json",
+                    headers={"Content-Disposition": "attachment; filename=ledger_backup.json"})
+
+
+@app.post("/api/backup/import")
+def api_backup_import(data: dict, db: Session = Depends(get_db)):
+    """Import data from a backup JSON. Skips existing records by natural key."""
+    imported = {}
+    skipped = {}
+    errors = []
+
+    def _import_rows(key, Model, unique_cols, fk_clear):
+        rows = data.get(key, [])
+        count = 0
+        cols = [c.name for c in Model.__table__.columns]
+        for r in rows:
+            # Build filter for natural key (or ID)
+            existing = None
+            filters = []
+            for uc in unique_cols:
+                if r.get(uc) is not None:
+                    filters.append(getattr(Model, uc) == r[uc])
+            if filters:
+                existing = db.query(Model).filter(*filters).first()
+            elif r.get("id"):
+                existing = db.query(Model).filter(Model.id == r["id"]).first()
+
+            # Clear foreign keys and id
+            for fk in fk_clear:
+                r.pop(fk, None)
+            row_id = r.pop("id", None)
+
+            try:
+                if existing:
+                    # Update existing record
+                    for k, v in r.items():
+                        if k in cols and k != "id":
+                            setattr(existing, k, v)
+                else:
+                    obj = Model(**{k: v for k, v in r.items() if k in cols})
+                    if row_id:
+                        obj.id = row_id
+                    db.add(obj)
+                count += 1
+            except Exception as e:
+                errors.append(f"{key}: {e}")
+        db.commit()
+        imported[key] = count
+
+    _import_rows("accounts", Account, ["name"], ["parent_id"])
+    _import_rows("monthly_balances", MonthlyBalance, ["account_id", "year", "month"], [])
+    _import_rows("income_records", IncomeRecord, [], [])
+    _import_rows("expense_records", ExpenseRecord, [], [])
+    _import_rows("expense_categories", ExpenseCategory, ["name"], [])
+    _import_rows("recurring_expenses", RecurringExpense, [], [])
+    _import_rows("investment_records", InvestmentRecord, [], [])
+    _import_rows("exchange_rates", ExchangeRate, ["from_currency", "to_currency"], [])
+    _import_rows("dca_plans", DcaPlan, [], [])
+
+    return {"ok": True, "imported": imported, "skipped": skipped, "errors": errors}
 
 
 if __name__ == "__main__":

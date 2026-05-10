@@ -5,6 +5,7 @@ import math
 import os
 import json
 import time as time_mod
+from datetime import datetime
 
 import yfinance as yf
 import pandas as pd
@@ -94,12 +95,21 @@ def run_backtest(params):
     triggers = params.get("triggers", [])
     dca = params.get("dca") or {}
     rr = params.get("rapid_rally") or {}
+    seed_raw = params.get("seed")
+    if isinstance(seed_raw, dict):
+        seed = seed_raw
+    elif seed_raw and float(seed_raw) > 0:
+        seed = {"ticker": symbol, "amount": float(seed_raw)}
+    else:
+        seed = {}
 
     # Collect all tickers needed
     all_tickers = {symbol}
     for tr in triggers:
         for b in tr.get("buys", []):
             all_tickers.add(b["ticker"])
+    if isinstance(seed, dict) and seed.get("amount", 0) > 0:
+        all_tickers.add(seed.get("ticker", symbol))
     if dca.get("enabled"):
         all_tickers.add(dca.get("ticker", symbol))
 
@@ -141,6 +151,26 @@ def run_backtest(params):
 
     # ── Run simulation ──
     trades = []
+    # Seed capital (底仓) — buy on day 0
+    if isinstance(seed, dict) and seed.get("amount", 0) > 0:
+        seed_ticker = seed.get("ticker", symbol)
+        seed_px = float(closes[seed_ticker].iloc[0])
+        seed_amt = float(seed["amount"])
+        if not pd.isna(seed_px) and seed_px > 0:
+            seed_shares = math.ceil(seed_amt / seed_px)
+            trades.append({
+                "ath_date": dates[0].strftime("%Y-%m-%d"),
+                "ath_price": round(float(underlying.iloc[0]), 2),
+                "mode": "normal",
+                "date": dates[0].strftime("%Y-%m-%d"),
+                "trigger": "底仓",
+                "dd_actual": "0.0%",
+                "ticker": seed_ticker,
+                "price": round(float(seed_px), 2),
+                "shares": seed_shares,
+                "cost": round(float(seed_shares * seed_px), 2),
+            })
+
     triggered = [False] * len(triggers_sorted)
     ath = underlying.iloc[0]
     ath_date = dates[0]
@@ -222,30 +252,61 @@ def run_backtest(params):
     dca_daily_cost = [0.0] * len(closes)
     if dca.get("enabled"):
         dca_ticker = dca.get("ticker", symbol)
-        dca_amount = float(dca.get("amount_per_day", 0))
+        dca_amount = float(dca.get("amount", dca.get("amount_per_day", 0)))
+        dca_freq = dca.get("frequency", "daily")
         dca_end = dca.get("end_date", end)
         running_shares = 0.0
         running_cost = 0.0
+        _last_period = None
         for i in range(len(closes)):
             date_str = dates_str[i]
-            if date_str <= dca_end:
-                px = closes[dca_ticker].iloc[i]
-                if not pd.isna(px) and px > 0:
-                    running_shares += dca_amount / px
-                    running_cost += dca_amount
+            if date_str > dca_end:
+                dca_daily_val[i] = round(float(running_shares * closes[dca_ticker].iloc[i]), 2)
+                dca_daily_cost[i] = round(float(running_cost), 2)
+                continue
+            px = closes[dca_ticker].iloc[i]
+            if pd.isna(px) or px <= 0:
+                dca_daily_val[i] = 0.0
+                dca_daily_cost[i] = round(float(running_cost), 2)
+                continue
+            # Determine if this day triggers a buy
+            dt = datetime.strptime(date_str, "%Y-%m-%d")
+            if dca_freq == "daily":
+                trigger = True
+                period_key = date_str
+            elif dca_freq == "weekly":
+                iso = dt.isocalendar()
+                period_key = f"{iso[0]}-W{iso[1]:02d}"
+                trigger = (period_key != _last_period)
+            elif dca_freq == "monthly":
+                period_key = date_str[:7]
+                trigger = (period_key != _last_period)
+            elif dca_freq == "yearly":
+                period_key = date_str[:4]
+                trigger = (period_key != _last_period)
+            else:
+                trigger = True
+                period_key = date_str
+            if trigger:
+                running_shares += dca_amount / float(px)
+                running_cost += dca_amount
+                _last_period = period_key
             dca_daily_val[i] = round(float(running_shares * closes[dca_ticker].iloc[i]), 2)
             dca_daily_cost[i] = round(float(running_cost), 2)
+        freq_labels = {"daily": "日", "weekly": "周", "monthly": "月", "yearly": "年"}
         dca_records = {
             "enabled": True,
             "ticker": dca_ticker,
-            "amount_per_day": dca_amount,
+            "amount": dca_amount,
+            "frequency": dca_freq,
+            "frequency_label": freq_labels.get(dca_freq, dca_freq),
             "end_date": dca_end,
             "total_cost": round(float(running_cost), 2),
             "final_value": dca_daily_val[-1],
         }
 
         # ── Monthly tables: prep data for deferred emission ──
-        _mo = {}  # builder state hoisted out of this block
+        _mo = {}
         _mo["month_last_idx"] = {}
         _mo["dca_shares_run"] = []
         _mo["dca_cost_run"] = []
@@ -270,10 +331,19 @@ def run_backtest(params):
 
         dca_trades = True  # flag, actual rows built after combined_val
     else:
-        dca_trades = []
-        dca_only = []
-        annual = []
-        _mo = None
+        # No DCA: build minimal _mo for monthly/annual tables
+        _mo = {}
+        _mo["month_last_idx"] = {}
+        _mo["dca_shares_run"] = [0.0] * len(dates_str)
+        _mo["dca_cost_run"] = [0.0] * len(dates_str)
+        _mo["dca_ticker"] = symbol
+        for i in range(len(dates_str)):
+            _mo["month_last_idx"][dates_str[i][:7]] = i
+        _mo["trig_cost_by_month"] = {}
+        for t in trades:
+            ym = t["date"][:7]
+            _mo["trig_cost_by_month"][ym] = _mo["trig_cost_by_month"].get(ym, 0.0) + t["cost"]
+        dca_trades = True
 
     # ── Daily values for the main strategy ──
     # Aggregate by ticker
@@ -511,13 +581,24 @@ def run_backtest(params):
             "sharpe": spy_sharpe,
         }
 
-    return {
+    # NaN sanitizer for JSON compliance
+    def _clean(v):
+        if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+            return 0.0
+        if isinstance(v, dict):
+            return {k: _clean(vv) for k, vv in v.items()}
+        if isinstance(v, list):
+            return [_clean(vv) for vv in v]
+        return v
+
+    return _clean({
         "config": {
             "symbol": symbol, "start": start, "end": end,
             "ath_reset": ath_reset,
             "rapid_rally": {"enabled": rapid_enabled, "days": rapid_days, "pct": rapid_pct},
             "triggers": [{"drawdown_pct": t["drawdown_pct"], "buys": [{"ticker": b.get("ticker","?"), "mode": b.get("mode","amount"), "value": b.get("value",0)} for b in t.get("buys",[])]} for t in triggers_sorted],
             "dca": dca_records,
+            "seed": {"ticker": seed.get("ticker", symbol), "amount": seed.get("amount", 0)} if isinstance(seed, dict) and seed.get("amount", 0) > 0 else None,
         },
         "dates": dates_str,
         "trades": trades,
@@ -563,4 +644,4 @@ def run_backtest(params):
             "max_dd_pct": round(bh_max_dd, 2),
         },
         "underlying_prices": [round(float(x), 2) for x in underlying.tolist()],
-    }
+    })

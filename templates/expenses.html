@@ -22,7 +22,7 @@
       <input id="expCategory" list="catList" placeholder="选择或输入">
       <datalist id="catList"></datalist>
     </div>
-    <div class="field"><label>金额</label><input id="expAmount" type="number" step="0.01" placeholder="0.00"></div>
+    <div class="field"><label>金额</label><input id="expAmount" type="number" step="0.01" min="0.01" placeholder="0.00"></div>
     <div class="field"><label>描述</label><input id="expDesc" placeholder="买了什么..."></div>
     <input type="hidden" id="expEditId" value=""><button class="btn btn-primary" id="expSaveBtn" onclick="saveExpense()" style="align-self:flex-end;">保存</button><button class="btn btn-secondary" id="expCancelBtn" style="display:none;align-self:flex-end;" onclick="cancelEditExp()">取消编辑</button>
   </div>
@@ -53,10 +53,10 @@
     <div class="form-grid">
       <div class="field"><label>描述</label><input id="recDesc" placeholder="房租 / iPhone分期"></div>
       <div class="field"><label>分类</label><input id="recCategory" list="catList" placeholder="房租"></div>
-      <div class="field"><label>金额</label><input id="recAmount" type="number" step="0.01" placeholder="0.00"></div>
+      <div class="field"><label>金额</label><input id="recAmount" type="number" step="0.01" min="0.01" placeholder="0.00"></div>
       <div class="field"><label>付款账户</label><select id="recAccount"><option value="">—</option></select></div>
-      <div class="field"><label>开始年月</label><div style="display:flex;gap:4px;align-items:center;"><input id="recStartYear" type="number" placeholder="2026" style="width:70px;"><span>年</span><input id="recStartMonth" type="number" placeholder="1" style="width:50px;"><span>月</span></div></div>
-      <div class="field"><label>结束年月 <span style="color:var(--sumi-light);font-weight:400;">(空=持续)</span></label><div style="display:flex;gap:4px;align-items:center;"><input id="recEndYear" type="number" placeholder="2027" style="width:70px;"><span>年</span><input id="recEndMonth" type="number" placeholder="12" style="width:50px;"><span>月</span></div></div>
+      <div class="field"><label>开始年月</label><div style="display:flex;gap:4px;align-items:center;"><input id="recStartYear" type="number" min="2000" placeholder="2026" style="width:70px;"><span>年</span><input id="recStartMonth" type="number" min="1" max="12" placeholder="1" style="width:50px;"><span>月</span></div></div>
+      <div class="field"><label>结束年月 <span style="color:var(--sumi-light);font-weight:400;">(空=持续)</span></label><div style="display:flex;gap:4px;align-items:center;"><input id="recEndYear" type="number" min="2000" placeholder="2027" style="width:70px;"><span>年</span><input id="recEndMonth" type="number" min="1" max="12" placeholder="12" style="width:50px;"><span>月</span></div></div>
     </div>
     <div style="margin-top:10px; display:flex; gap:8px;">
       <button class="btn btn-primary btn-sm" onclick="saveRecurring()">保存</button>

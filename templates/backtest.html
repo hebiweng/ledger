@@ -21,8 +21,8 @@
       <input type="checkbox" id="btRapidEnabled" onchange="toggleRapid()" style="width:14px;height:14px;margin:0;">快速上涨
     </label>
     <span id="rapidOpts" style="display:none;display:flex;gap:4px;align-items:center;white-space:nowrap;">
-      <input id="btRapidDays" type="number" value="21" step="1" style="width:70px;height:32px;text-align:center;font-size:14px;"> 天涨超
-      <input id="btRapidPct" type="number" value="10" step="1" style="width:70px;height:32px;text-align:center;font-size:14px;"> % 启用深档
+      <input id="btRapidDays" type="number" min="1" value="21" step="1" style="width:70px;height:32px;text-align:center;font-size:14px;"> 天涨超
+      <input id="btRapidPct" type="number" min="1" value="10" step="1" style="width:70px;height:32px;text-align:center;font-size:14px;"> % 启用深档
     </span>
     <span style="color:var(--border);margin:0 4px;">|</span>
     <label style="display:flex;align-items:center;gap:4px;cursor:pointer;white-space:nowrap;">
@@ -30,7 +30,10 @@
     </label>
     <span id="dcaOpts" style="display:none;display:flex;gap:8px;align-items:center;white-space:nowrap;">
       <input id="btDcaTicker" value="QQQ" style="width:70px;height:32px;text-transform:uppercase;text-align:center;font-size:14px;">
-      每日 $<input id="btDcaAmount" type="number" value="35" step="1" style="width:70px;height:32px;text-align:center;font-size:14px;">
+      <select id="btDcaFreq" style="height:32px;width:56px;font-size:14px;">
+        <option value="daily">日</option><option value="weekly">周</option><option value="monthly">月</option><option value="yearly">年</option>
+      </select>
+      $<input id="btDcaAmount" type="number" min="0.01" value="35" step="1" style="width:70px;height:32px;text-align:center;font-size:14px;">
       截止 <input id="btDcaEnd" type="date" value="2026-05-09" style="height:32px;width:135px;font-size:14px;">
     </span>
   </div>
@@ -38,13 +41,19 @@
   <!-- Trigger rules -->
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
     <span style="font-family:var(--font-display);font-style:italic;font-size:17px;font-weight:600;">触发买入规则</span>
-    <button class="btn btn-primary btn-sm" onclick="addTrigger()">+ 添加档位</button>
+    <div style="display:flex;align-items:center;gap:8px;">
+      <span style="font-size:12.5px;color:var(--sumi-light);">底仓</span>
+      <input id="btSeedTicker" value="QQQ" style="width:60px;height:28px;text-transform:uppercase;text-align:center;font-size:12px;">
+      $<input id="btSeedAmount" type="number" min="0" value="0" step="100" style="width:80px;height:28px;text-align:center;font-size:12px;">
+      <button class="btn btn-primary btn-sm" onclick="addTrigger()">+ 添加档位</button>
+    </div>
   </div>
   <div id="triggerList"></div>
 
   <!-- Run -->
   <div style="margin-top:16px;display:flex;align-items:center;gap:16px;">
     <button class="btn btn-primary" id="btRunBtn" onclick="runBacktest()">▶ 运行回测</button>
+    <button class="btn btn-secondary" id="btReportBtn" onclick="downloadPDF()" style="display:none;">📄 下载 PDF</button>
     <span style="font-size:11px;color:var(--sumi-light);">数据来源: Yahoo Finance · 首次拉取较慢，后续走本地缓存</span>
   </div>
 </div>
@@ -158,10 +167,13 @@ function collectParams() {
     });
     if (buys.length) triggers.push({ drawdown_pct: -Math.abs(dd) / 100, buys });
   });
+  const seedTicker = document.getElementById('btSeedTicker').value.toUpperCase();
+  const seedAmount = parseFloat(document.getElementById('btSeedAmount').value) || 0;
   return {
     symbol: document.getElementById('btSymbol').value.toUpperCase(),
     start: document.getElementById('btStart').value,
     end: document.getElementById('btEnd').value,
+    seed: seedAmount > 0 ? { ticker: seedTicker, amount: seedAmount } : null,
     ath_reset: document.getElementById('btAthReset').checked,
     rapid_rally: document.getElementById('btRapidEnabled').checked ? {
       enabled: true,
@@ -172,7 +184,8 @@ function collectParams() {
     dca: document.getElementById('btDcaEnabled').checked ? {
       enabled: true,
       ticker: document.getElementById('btDcaTicker').value.toUpperCase(),
-      amount_per_day: parseFloat(document.getElementById('btDcaAmount').value) || 0,
+      frequency: document.getElementById('btDcaFreq').value,
+      amount: parseFloat(document.getElementById('btDcaAmount').value) || 0,
       end_date: document.getElementById('btDcaEnd').value,
     } : { enabled: false },
   };
@@ -180,11 +193,11 @@ function collectParams() {
 
 // ── Run ──
 let chartNav=null, chartDD=null;
+let _btData = null;
 
 async function runBacktest() {
   const params = collectParams();
   if (!params.symbol || !params.start || !params.end) return toast('请填写标的、起始/结束日期', 'err');
-  if (!params.triggers.length && !params.dca.enabled) return toast('至少添加一个触发档位或启用定投', 'err');
 
   const btn = document.getElementById('btRunBtn');
   btn.textContent = '⏳ 获取数据中...'; btn.disabled = true;
@@ -192,7 +205,9 @@ async function runBacktest() {
     const r = await fetch('/api/backtest/run', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(params) });
     if (!r.ok) { const e = await r.json(); throw new Error(e.detail || 'Server error'); }
     const d = await r.json();
+    _btData = d;
     document.getElementById('btResults').style.display = '';
+    document.getElementById('btReportBtn').style.display = '';
     renderResults(d);
     btn.textContent = '▶ 运行回测';
   } catch(e) {
@@ -237,7 +252,7 @@ function renderSummary(d) {
   if (hasDca) {
     html += row('合并 (策略+DCA)', s.combined_cost, s.combined_value, s.combined_return_pct, s.combined_cagr, s.combined_max_dd_pct, s.combined_sharpe, s.trade_count + ' 笔', true, false);
     html += row('∟ 回撤触发', s.total_cost, s.final_value, s.return_pct, s.cagr, s.max_dd_pct, s.sharpe, s.trade_count + ' 笔', false, true);
-    html += row(`∟ DCA (${d.config.dca.ticker})`, s.dca_cost, s.dca_value, s.dca_return_pct, s.dca_cagr, s.dca_max_dd_pct, s.dca_sharpe, dcaMonths + ' 月', false, true);
+    html += row(`∟ DCA (${d.config.dca.ticker} · $${d.config.dca.amount}/${d.config.dca.frequency_label})`, s.dca_cost, s.dca_value, s.dca_return_pct, s.dca_cagr, s.dca_max_dd_pct, s.dca_sharpe, dcaMonths + ' 月', false, true);
   } else {
     html += row('合并 (策略+DCA)', s.total_cost, s.final_value, s.return_pct, s.cagr, s.max_dd_pct, s.sharpe, s.trade_count + ' 笔', true, false);
   }
@@ -403,6 +418,27 @@ function renderHoldings(d) {
     <tr style="font-weight:600;"><td>合计</td><td></td><td>$${s.combined_cost.toLocaleString()}</td><td></td><td>$${s.combined_value.toLocaleString()}</td><td class="${s.combined_value-s.combined_cost>=0?'diff-positive':'diff-negative'}">${s.combined_value-s.combined_cost>=0?'+':''}$${Math.abs(s.combined_value-s.combined_cost).toLocaleString()}</td><td class="${s.combined_return_pct>=0?'diff-positive':'diff-negative'}">${s.combined_return_pct>=0?'+':''}${s.combined_return_pct}%</td></tr>
     </tbody></table>
   `;
+}
+
+async function downloadPDF() {
+  const params = collectParams();
+  if (!params.symbol || !params.start || !params.end) return toast('请填写完整参数', 'err');
+  const btn = document.getElementById('btReportBtn');
+  btn.textContent = '⏳ 生成中...'; btn.disabled = true;
+  try {
+    const r = await fetch('/api/backtest/report', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(params) });
+    if (!r.ok) throw new Error('生成失败');
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'backtest_report.pdf'; a.click();
+    URL.revokeObjectURL(url);
+    btn.textContent = '📄 下载 PDF';
+  } catch(e) {
+    toast('PDF生成失败: ' + e.message, 'err');
+    btn.textContent = '📄 下载 PDF';
+  }
+  btn.disabled = false;
 }
 
 // ── Init defaults ──

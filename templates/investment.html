@@ -4,7 +4,7 @@
 <!-- Investment summary -->
 <div class="card">
   <div class="card-header">投资总览</div>
-  <div class="summary-grid" id="portfolioSummary">
+  <div class="summary-grid" id="portfolioSummary" style="grid-template-columns: repeat(6, 1fr);">
     <div class="summary-card">
       <div class="label">当前总市值</div>
       <div class="value" id="sumValue">—</div>
@@ -24,6 +24,10 @@
     <div class="summary-card">
       <div class="label">持仓标的</div>
       <div class="value" id="sumCount">—</div>
+    </div>
+    <div class="summary-card">
+      <div class="label">累计手续费</div>
+      <div class="value" id="sumFees">—</div>
     </div>
   </div>
 </div>
@@ -63,14 +67,12 @@
       </select></div>
     <div class="field"><label>资产 / 标的</label><input id="invAsset" placeholder="QQQ / 600519 / 016452..."></div>
 
-    <div class="field"><label>数量</label><input id="invQty" type="number" step="0.01"></div>
-    <div class="field"><label>单价</label><input id="invPrice" type="number" step="0.01"></div>
-    <div class="field"><label>手续费</label><input id="invFees" type="number" step="0.01" value="0"></div>
-    <div class="field"><label>总金额</label><input id="invTotal" type="number" step="0.01" placeholder="数量×单价+手续费"></div>
+    <div class="field"><label>数量</label><input id="invQty" type="number" step="0.01" min="0.01"></div>
+    <div class="field"><label>单价</label><input id="invPrice" type="number" step="0.01" min="0.01"></div>
+    <div class="field"><label>手续费</label><input id="invFees" type="number" step="0.01" min="0" value="0"></div>
+    <div class="field"><label>总金额</label><input id="invTotal" type="number" step="0.01" placeholder="数量×单价"></div>
 
-    <div class="field"><label>币种</label>
-      <input id="invCurrency" list="currencyList" value="USD">
-      <datalist id="currencyList"><option value="USD"><option value="CNY"><option value="HKD"><option value="EUR"><option value="GBP"><option value="JPY"><option value="AUD"><option value="SGD"><option value="BTC"><option value="ETH"><option value="USDT"></datalist></div>
+    <div class="field"><label>币种</label><input id="invCurrency" value="USD"></div>
     <div class="field"><label>平台</label><input id="invPlatform" placeholder="富途 / 盈透"></div>
     <div class="field"><label>账户</label><select id="invAccount"><option value="">—</option></select></div>
     <div class="field"><label>备注</label><input id="invNotes"></div>
@@ -94,8 +96,8 @@
           <option value="reit">REITs</option><option value="index">指数</option><option value="commodity">大宗商品</option>
           <option value="cash">现金/存款</option><option value="other">其他</option>
         </select></div>
-      <div class="field"><label>每期金额</label><input id="dcaAmount" type="number" step="0.01"></div>
-      <div class="field"><label>手续费</label><input id="dcaFees" type="number" step="0.01" value="0"></div>
+      <div class="field"><label>每期金额</label><input id="dcaAmount" type="number" step="0.01" min="0.01"></div>
+      <div class="field"><label>手续费</label><input id="dcaFees" type="number" step="0.01" min="0" value="0"></div>
       <div class="field"><label>频率</label>
         <select id="dcaFreq"><option value="weekly">每周</option><option value="biweekly">双周</option><option value="monthly" selected>每月</option></select></div>
       <div class="field"><label>下次执行</label><input id="dcaNext" type="date"></div>
@@ -175,8 +177,7 @@ function onTypeChange() {
 function calcTotal() {
   const qty = parseFloat(document.getElementById('invQty').value) || 0;
   const price = parseFloat(document.getElementById('invPrice').value) || 0;
-  const fees = parseFloat(document.getElementById('invFees').value) || 0;
-  document.getElementById('invTotal').value = (qty * price + fees).toFixed(2);
+  document.getElementById('invTotal').value = (qty * price).toFixed(2);
 }
 
 function onAssetTypeChange() {
@@ -205,6 +206,7 @@ async function loadPortfolio(refresh) {
     const chgClass = (summary.daily_change_pct||0) >= 0 ? 'positive' : 'negative';
     document.getElementById('sumChange').innerHTML = `<span class="${chgClass}">${chgSign}${summary.daily_change_pct}%</span></span>`;
     document.getElementById('sumCount').textContent = summary.holdings_count + ' 个';
+    document.getElementById('sumFees').textContent = summary.total_fees_cny != null ? '¥' + summary.total_fees_cny.toLocaleString() : '¥0';
   }
 
   if (holdings.length === 0) {
@@ -219,15 +221,30 @@ async function loadPortfolio(refresh) {
     </tr></thead>
     <tbody>${holdings.map(h => {
       const profitClass = h.profit != null ? (h.profit >= 0 ? 'diff-positive' : 'diff-negative') : '';
-      const profitDisplay = h.profit != null ? `${h.profit_pct >= 0 ? '+' : ''}${h.profit_pct}%` : '<span style="color:var(--sumi-light);font-size:11px;">点击刷新</span>';
+      const profitDisplay = h.profit != null
+        ? `<div>${h.profit_pct >= 0 ? '+' : ''}${h.profit_pct}%</div><div style="font-size:11px;color:var(--sumi-light);">${h.profit >= 0 ? '+' : '-'}$${Math.abs(h.profit).toLocaleString()}</div>`
+        : '<span style="color:var(--sumi-light);font-size:11px;">点击刷新</span>';
       const changeClass = h.change_pct != null ? (h.change_pct >= 0 ? 'diff-positive' : 'diff-negative') : '';
       const changeDisplay = h.change_pct != null ? `${h.change_pct >= 0 ? '+' : ''}${h.change_pct}%` : '—';
-      const nameDisplay = h.display_name || '—';
+      const quoteUrl = (() => {
+        const sym = h.asset_name.toUpperCase();
+        if (h.asset_type === 'crypto') return `https://www.tradingview.com/symbols/${sym}USD/`;
+        if (h.asset_type === 'fund') return `https://fund.eastmoney.com/${sym}.html`;
+        // Chinese A-share: detect exchange
+        if (/^\d{6}$/.test(sym)) {
+          if (sym.startsWith('60') || sym.startsWith('68') || sym.startsWith('5')) return `https://finance.yahoo.com/quote/${sym}.SS`;
+          if (sym.startsWith('00') || sym.startsWith('30')) return `https://finance.yahoo.com/quote/${sym}.SZ`;
+        }
+        // HK: 1-5 digits
+        if (/^\d{1,5}$/.test(sym)) return `https://finance.yahoo.com/quote/${sym.padStart(4,'0')}.HK`;
+        return `https://finance.yahoo.com/quote/${sym}`;
+      })();
+      const nameDisplay = h.display_name || h.asset_name;
       const priceDisplay = h.current_price
         ? `<div>${h.current_price.toLocaleString()} ${h.currency}</div><div style="font-size:11px;color:var(--sumi-light);">均价 ${h.avg_cost.toLocaleString()}</div>`
         : '—';
       return `<tr>
-        <td style="font-weight:500;">${h.asset_name}</td>
+        <td style="font-weight:500;"><a href="${quoteUrl}" target="_blank" rel="noopener" style="color:inherit;text-decoration:underline dotted;">${h.asset_name}</a></td>
         <td style="font-size:12px;color:var(--sumi-light);">${nameDisplay}</td>
         <td><span class="badge ${atypeBadge(h.asset_type)}">${atypeLabel(h.asset_type)}</span></td>
         <td class="num-col">${h.quantity.toLocaleString()}</td>
@@ -243,9 +260,9 @@ async function loadPortfolio(refresh) {
 function startAutoRefresh() {
   if (portfolioTimer) clearInterval(portfolioTimer);
   portfolioTimer = setInterval(() => {
-    if (document.visibilityState === 'visible') loadPortfolio(true);
+    if (document.visibilityState === 'visible') loadPortfolio(false);
   }, 60000);
-  loadPortfolio(true);  // immediate first fetch
+  loadPortfolio(false);  // initial load from cache
 }
 
 function stopAutoRefresh() {
@@ -358,7 +375,7 @@ async function confirmExecuteDca() {
   const result = await r.json();
   document.getElementById('dcaExecDialog').style.display = 'none';
   // overlay is dcaExecDialog itself
-  loadDcaPlans(); loadInvestments(); loadPortfolio(false); loadSummary();
+  loadDcaPlans(); loadInvestments(); loadPortfolio(true); loadSummary();
   if (result.balance_ok === false) {
     toast('定投已执行，但扣款账户余额不足！', 'warn');
   } else {
@@ -399,7 +416,7 @@ async function saveInvestment() {
   const method = editId ? 'PUT' : 'POST';
   await fetch(url, { method, headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) });
   resetInvForm();
-  loadInvestments(); loadPortfolio(false); loadSummary();
+  loadInvestments(); loadPortfolio(true); loadSummary();
   toast(editId ? '已更新' : '已保存', 'ok');
 }
 
@@ -453,7 +470,7 @@ async function loadInvestments() {
     <td><span class="badge ${typeColors[inv.type]||'badge-gray'}">${typeLabels[inv.type]||inv.type}</span></td>
     <td>${inv.asset_name}</td>
     <td class="num-col">${inv.quantity||'—'}</td>
-    <td class="num-col">${inv.price||'—'}</td>
+    <td class="num-col">${inv.price ? inv.price.toLocaleString() : (inv.quantity && inv.total_amount ? Math.round(inv.total_amount/inv.quantity*100)/100 : '—')}</td>
     <td class="num-col" style="font-weight:500;">${inv.total_amount.toLocaleString()} ${inv.currency}</td>
     <td>${inv.platform}</td>
     <td><button class="btn btn-secondary btn-xs" onclick="editInvestment(${inv.id})">✎</button><button class="btn btn-danger btn-xs" onclick="deleteInvestment(${inv.id})">✕</button></td>
@@ -466,7 +483,7 @@ async function loadInvestments() {
 async function deleteInvestment(id) {
   showConfirm('删除', '确定删除？', async () => {
     await fetch(`/api/investments/${id}`, { method:'DELETE' });
-    toast('已删除','ok'); loadInvestments(); loadPortfolio(false); loadSummary();
+    toast('已删除','ok'); loadInvestments(); loadPortfolio(true); loadSummary();
   });
 }
 
@@ -488,7 +505,9 @@ async function loadBalances() {
 }
 
 async function loadSummary() {
-  // Investment stats are displayed in the investment summary cards and portfolio section
+  const r = await fetch('/api/stats/investment');
+  const data = await r.json();
+  document.getElementById('sumValue').innerHTML = '¥' + (data.accounts || []).reduce((s,a) => s + (a.balance_cny||0), 0).toLocaleString();
 }
 
 init();
@@ -507,7 +526,7 @@ init();
         <input type="radio" name="execPriceSrc" id="execCustomRadio" onchange="toggleExecPrice()">
         <span>手动输入价格</span>
       </label>
-      <input type="number" id="execCustomPrice" step="0.0001" placeholder="输入买入价格" style="display:none;margin-top:8px;width:100%;">
+      <input type="number" id="execCustomPrice" min="0.01" step="0.0001" placeholder="输入买入价格" style="display:none;margin-top:8px;width:100%;">
     </div>
     <input type="hidden" id="execDcaId" value="">
     <div class="confirm-actions">

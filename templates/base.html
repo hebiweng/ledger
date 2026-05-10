@@ -65,8 +65,8 @@
 
   // Shared account detail panel
   window._detailAccId = null;
-  const typeLabels = { bank: '银行储蓄', ewallet: '电子钱包', credit: '信用卡', topup: '充值账户', investment: '投资账户', loan: '贷款' };
-  const typeColors = { bank: 'badge-blue', ewallet: 'badge-green', credit: 'badge-red', topup: 'badge-gray', investment: 'badge-gray', loan: 'badge-red' };
+  const typeLabels = { bank: '借记卡', ewallet: '电子钱包', credit: '信用卡', topup: '充值账户', investment: '投资账户', loan: '贷款', cash: '现金' };
+  const typeColors = { bank: 'badge-blue', ewallet: 'badge-green', credit: 'badge-red', topup: 'badge-gray', investment: 'badge-gray', loan: 'badge-red', cash: 'badge-green' };
 
   async function showAccountDetail(accId) {
     window._detailAccId = accId;

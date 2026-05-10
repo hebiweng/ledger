@@ -338,6 +338,8 @@ input[type="date"], input[type="time"] { min-width: 130px; color-scheme: light; 
   align-items: center;
   justify-content: center;
 }
+#sharedConfirm { z-index: 99999 !important; }
+#detailPanel { z-index: 10001; }
 .panel {
   background: var(--washi-card);
   border-radius: var(--radius-lg);

@@ -8,10 +8,11 @@
       <div class="field"><label>账户名</label><input id="accName" placeholder="工行储蓄卡" style="width:150px;"></div>
       <div class="field"><label>类型</label>
         <select id="accType" style="width:110px;">
-          <option value="bank">银行储蓄</option>
+          <option value="bank">借记卡</option>
           <option value="ewallet">电子钱包</option>
           <option value="credit">信用卡</option>
           <option value="loan">贷款</option>
+          <option value="cash">现金</option>
           <option value="topup">充值账户</option>
           <option value="investment">投资账户</option>
         </select>
@@ -110,9 +111,10 @@ async function addAccount() {
     body: JSON.stringify({ name, type, currency: currencies[0], currencies, sort_order: 0 })
   });
   document.getElementById('accName').value = '';
-  // Reset currency fields to just one
-  document.getElementById('currencyFields').querySelectorAll('.form-grid:not(:first-child)').forEach(el => el.remove());
-  document.querySelector('.acc-currency').value = 'CNY';
+  // Reset currency fields to just the first one
+  const cf = document.getElementById('currencyFields');
+  while (cf.children.length > 1) cf.lastElementChild.remove();
+  document.querySelector('.acc-currency').value = '';
   loadAccounts();
 }
 
@@ -138,6 +140,54 @@ function deleteAccount(id, name) {
 }
 
 loadAccounts();
+</script>
+
+<div class="card">
+  <div class="card-header">数据管理</div>
+  <div style="display:flex;gap:12px;align-items:center;">
+    <button class="btn btn-primary btn-sm" onclick="exportData()">📥 导出备份</button>
+    <label class="btn btn-secondary btn-sm" style="cursor:pointer;">
+      📤 导入备份
+      <input type="file" id="importFile" accept=".json" onchange="importData(this)" style="display:none;">
+    </label>
+    <span style="font-size:11px;color:var(--sumi-light);">支持全量备份还原，格式 JSON</span>
+  </div>
+</div>
+
+<script>
+async function exportData() {
+  const a = document.createElement('a');
+  a.href = '/api/backup/export';
+  a.download = 'ledger_backup.json';
+  a.click();
+  toast('备份已下载', 'ok');
+}
+
+async function importData(input) {
+  const file = input.files[0];
+  if (!file) return;
+  showConfirm('导入备份', `确定要导入 <b>${file.name}</b> 吗？<br><br>已存在的记录会跳过，不会覆盖。`, async () => {
+    try {
+      const text = await file.text();
+      const data = JSON.parse(text);
+      const r = await fetch('/api/backup/import', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(data)
+      });
+      const result = await r.json();
+      let msg = [];
+      for (const [k, v] of Object.entries(result.imported)) {
+        msg.push(`${k}: +${v}`);
+      }
+      toast('导入完成: ' + msg.join(', '), 'ok');
+      loadAccounts();
+    } catch(e) {
+      toast('导入失败: ' + e.message, 'err');
+    }
+  });
+  input.value = '';
+}
 </script>
 
 {% endblock %}
