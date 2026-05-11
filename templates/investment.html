@@ -389,26 +389,39 @@ async function loadDcaPlans() {
     const pnl = curVal - totalCost;
     const ret = totalCost > 0 ? (pnl / totalCost * 100) : null;
     const currSym = p.currency === 'USD' ? '$' : '¥';
+    const decPlaces = p.currency === 'USD' ? 4 : 2;
     const statusTag = p.is_active ? '<span class="badge badge-green">进行中</span>' : '<span class="badge badge-gray">已暂停</span>';
-    return `<div class="summary-card" style="padding:12px 16px;margin-bottom:8px;">
-      <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+    return `<div class="summary-card" style="padding:14px 18px;margin-bottom:10px;">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
         <div style="flex:1;min-width:0;">
-          <div style="font-size:14px;font-weight:700;margin-bottom:4px;">${p.asset_name} <span class="badge ${atypeBadge(p.asset_type)}" style="margin-left:4px;">${atypeLabel(p.asset_type)}</span> ${statusTag}</div>
-          <div style="font-size:12px;color:var(--sumi-light);margin-bottom:6px;">
-            ${freqLabels[p.frequency]||p.frequency} · ${currSym}${p.amount.toLocaleString()}${p.fees ? ' · 费率'+(p.fees/p.amount*100).toFixed(2)+'%' : ''} · 下次 ${p.next_date}
+          <div style="font-size:15px;font-weight:700;margin-bottom:6px;">
+            ${p.asset_name} <span class="badge ${atypeBadge(p.asset_type)}" style="margin-left:6px;">${atypeLabel(p.asset_type)}</span> ${statusTag}
           </div>
-          <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:4px 16px;font-size:13px;">
-            <div><span style="color:var(--sumi-light);">已投期数</span> <b>${buys.length}</b></div>
-            <div><span style="color:var(--sumi-light);">累计投入</span> <b>${currSym}${totalCost.toLocaleString()}</b></div>
-            <div><span style="color:var(--sumi-light);">累计份额</span> <b>${totalShares.toFixed(4)}</b></div>
-            <div><span style="color:var(--sumi-light);">平均成本</span> <b>${currSym}${avgCost.toFixed(2)}</b></div>
-            ${curPx > 0 ? `<div><span style="color:var(--sumi-light);">当前市值</span> <b>${currSym}${Math.round(curVal).toLocaleString()}</b></div>` : ''}
-            ${ret != null ? `<div><span style="color:var(--sumi-light);">收益率</span> <b class="${ret>=0?'diff-positive':'diff-negative'}">${ret>=0?'+':''}${ret.toFixed(2)}%</b></div>` : ''}
+          <div style="font-size:12px;color:var(--sumi-light);margin-bottom:8px;">
+            ${freqLabels[p.frequency]||p.frequency} · ${currSym}${p.amount.toLocaleString()}${p.fees ? ' · 费率'+(p.fees/p.amount*100).toFixed(2)+'%' : ''} · ${p.next_date} 开始${p.end_date ? ' · '+p.end_date+' 结束' : ' · 无限期'}
+          </div>
+          <div style="font-size:13px;line-height:1.8;">
+            <div style="display:flex;gap:20px;flex-wrap:wrap;">
+              <span>已投 <b>${buys.length}</b> 期</span>
+              <span>累计投入 <b>${currSym}${totalCost.toLocaleString()}</b></span>
+              <span>手续费 <b>${currSym}${totalFees.toLocaleString()}</b></span>
+            </div>
+            <div style="display:flex;gap:20px;flex-wrap:wrap;">
+              <span>累计份额 <b>${totalShares.toFixed(decPlaces)}</b></span>
+              <span>平均成本 <b>${currSym}${avgCost.toFixed(2)}</b></span>
+            </div>
+            <div style="display:flex;gap:20px;flex-wrap:wrap;">
+              ${curPx > 0 ? `<span>当前市值 <b>${currSym}${Math.round(curVal).toLocaleString()}</b></span>` : ''}
+              ${ret != null ? `<span>持仓收益 <b class="${pnl>=0?'diff-positive':'diff-negative'}">${pnl>=0?'+':''}${currSym}${Math.abs(Math.round(pnl)).toLocaleString()}</b></span>` : ''}
+              ${ret != null ? `<span>收益率 <b class="${ret>=0?'diff-positive':'diff-negative'}">${ret>=0?'+':''}${ret.toFixed(2)}%</b></span>` : ''}
+            </div>
+            <div style="font-size:12px;color:var(--sumi-light);margin-top:2px;">
+              下次执行：${p.next_date}
+            </div>
           </div>
         </div>
-        <div style="display:flex;gap:4px;flex-shrink:0;margin-left:12px;">
+        <div style="display:flex;flex-direction:column;gap:4px;flex-shrink:0;">
           <button class="btn btn-primary btn-xs" onclick="showExecuteDialog(${p.id})">立即定投</button>
-          <button class="btn btn-secondary btn-xs" onclick="backfillDca(${p.id})">补投</button>
           <button class="btn btn-secondary btn-xs" onclick="editDca(${p.id})">编辑</button>
           <button class="btn btn-xs" style="color:${p.is_active?'var(--kuchiba)':'var(--matcha)'};" onclick="toggleDca(${p.id},${p.is_active ? 0 : 1})">${p.is_active?'暂停':'恢复'}</button>
           <button class="btn btn-danger btn-xs" onclick="deactivateDca(${p.id})">删除</button>
@@ -846,9 +859,13 @@ init();
       <div class="field"><label>手续费率 (%)</label><input id="dcaFeeRate" type="number" step="0.01" min="0" value="0" placeholder="0.12"></div>
       <div class="field"><label>币种</label><input id="dcaCurr" value="USD"></div>
       <div class="field"><label>频率</label>
-        <select id="dcaFreq"><option value="daily">每日</option><option value="weekly">每周</option><option value="biweekly">双周</option><option value="monthly" selected>每月</option></select></div>
+        <select id="dcaFreq"><option value="daily">每日</option><option value="weekly">每周</option><option value="monthly" selected>每月</option></select></div>
+      <div class="field"><label>节假日处理</label>
+        <select id="dcaHoliday"><option value="skip">跳过本期</option><option value="next">顺延至下一交易日</option><option value="prev">提前至上一交易日</option></select></div>
       <div class="field"><label>开始日期</label><input id="dcaStartDate" type="date"></div>
-      <div class="field"><label>结束日期</label><input id="dcaEndDate" type="date" placeholder="空=无限期"></div>
+      <div class="field"><label>结束日期</label>
+        <div style="display:flex;gap:4px;align-items:center;"><input id="dcaEndDate" type="date" placeholder="空=无限期"> <label style="font-size:12px;white-space:nowrap;"><input type="checkbox" id="dcaEndInfinite" checked onchange="document.getElementById('dcaEndDate').disabled=this.checked"> 无限期</label></div></div>
+      <div class="field"><label>下次执行</label><input id="dcaNextDisplay" type="text" readonly style="background:var(--washi);"></div>
       <div class="field"><label>平台</label><input id="dcaPlatform" placeholder="富途 / 盈透"></div>
       <div class="field"><label>投资账户</label><select id="dcaAccount"><option value="">—</option></select></div>
       <div class="field"><label>扣款账户</label><select id="dcaPayAccount"><option value="">—</option></select></div>
