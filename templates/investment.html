@@ -97,23 +97,26 @@
   <div class="card-header">定投计划</div>
   <div id="dcaList"></div>
   <button class="btn btn-secondary btn-sm" style="margin-top:12px;" onclick="showDcaForm()">+ 添加定投</button>
-  <div id="dcaForm" style="display:none; margin-top:12px; padding:12px; background:var(--washi); border-radius:6px;">
+  <div id="dcaForm" style="display:none; margin-top:12px; padding:16px; background:var(--washi); border-radius:8px; border:1px solid var(--border-light);">
     <div class="form-grid-4">
-      <div class="field"><label>标的</label><input id="dcaAsset" placeholder="QQQ / 016452"></div>
+      <div class="field"><label>标的代码</label><input id="dcaAsset" placeholder="QQQ / 016452" onblur="autoFillName(this)"></div>
       <div class="field"><label>资产类型</label>
-        <select id="dcaAssetType">
+        <select id="dcaAssetType" onchange="onDcaTypeChange()">
           <option value="stock">股票</option><option value="etf">ETF</option><option value="fund">场外基金</option>
-          <option value="crypto">加密货币</option><option value="bond">债券</option><option value="future">期货</option>
-          <option value="reit">REITs</option><option value="index">指数</option><option value="commodity">大宗商品</option>
-          <option value="cash">现金/存款</option><option value="other">其他</option>
+          <option value="crypto">加密货币</option><option value="bond">债券</option><option value="reit">REITs</option><option value="other">其他</option>
         </select></div>
-      <div class="field"><label>每期金额</label><input id="dcaAmount" type="number" step="0.01" min="0.01"></div>
-      <div class="field"><label>手续费</label><input id="dcaFees" type="number" step="0.01" min="0" value="0"></div>
+      <div class="field"><label>定投方式</label>
+        <select id="dcaMode" onchange="onDcaModeChange()"><option value="amount">按金额</option><option value="shares">按数量</option></select></div>
+      <div class="field"><label id="dcaAmtLabel">每期金额</label><input id="dcaAmount" type="number" step="0.01" min="0.01"></div>
+      <div class="field" id="dcaQtyField" style="display:none;"><label>每期数量</label><input id="dcaQty" type="number" step="0.0001" min="0.0001"></div>
+      <div class="field"><label>手续费率 (%)</label><input id="dcaFeeRate" type="number" step="0.01" min="0" value="0" placeholder="0.12"></div>
+      <div class="field"><label>币种</label><input id="dcaCurr" value="USD" onchange="onDcaCurrChange()"></div>
       <div class="field"><label>频率</label>
-        <select id="dcaFreq"><option value="weekly">每周</option><option value="biweekly">双周</option><option value="monthly" selected>每月</option></select></div>
+        <select id="dcaFreq"><option value="daily">每日</option><option value="weekly">每周</option><option value="biweekly">双周</option><option value="monthly" selected>每月</option></select></div>
+      <div class="field"><label>开始日期</label><input id="dcaStartDate" type="date"></div>
+      <div class="field"><label>结束日期</label><input id="dcaEndDate" type="date" placeholder="空=无限期"></div>
       <div class="field"><label>下次执行</label><input id="dcaNext" type="date"></div>
-      <div class="field"><label>币种</label><input id="dcaCurr" value="USD"></div>
-      <div class="field"><label>平台</label><input id="dcaPlatform" placeholder="富途"></div>
+      <div class="field"><label>平台</label><input id="dcaPlatform" placeholder="富途 / 盈透"></div>
       <div class="field"><label>投资账户</label><select id="dcaAccount"><option value="">—</option></select></div>
       <div class="field"><label>扣款账户</label><select id="dcaPayAccount"><option value="">—</option></select></div>
     </div>
@@ -252,7 +255,10 @@ async function loadPortfolio(refresh) {
     });
     const labels = Object.keys(typeMap);
     const data = Object.values(typeMap);
-    const colors = { stock:'#4E79A7', etf:'#59A14F', fund:'#76B7B2', crypto:'#E15759', bond:'#B07AA1', option:'#F28E2B', future:'#F28E2B', forex:'#EDC948', reit:'#9C755F', index:'#BAB0AC', commodity:'#E15759', cash:'#59A14F', other:'#BAB0AC' };
+    const palettes = [['#427AB2','#F09148','#FF9896','#DBDB8D','#C59D94','#AFC7E8'],['#43978F','#9EC4BE','#ABD0F1','#DCE9F4','#E56F5E','#F19685','#F6C957','#FFB77F','#FBE8D5']];
+    const allColors = [...palettes[0], ...palettes[1]];
+    const typeColors = {};
+    Object.keys(typeNames).forEach((t, i) => { typeColors[t] = allColors[i % allColors.length]; });
     const typeNames = { stock:'股票', etf:'ETF', fund:'基金', crypto:'加密货币', bond:'债券', option:'期权', future:'期货', forex:'外汇', reit:'REITs', index:'指数', commodity:'商品', cash:'现金', other:'其他' };
 
     const ctx = document.getElementById('chartTypePie').getContext('2d');
@@ -261,7 +267,7 @@ async function loadPortfolio(refresh) {
       type: 'doughnut',
       data: {
         labels: labels.map(l => typeNames[l] || l),
-        datasets: [{ data, backgroundColor: labels.map(l => colors[l] || '#999'), borderWidth: 0 }]
+        datasets: [{ data, backgroundColor: labels.map(l => typeColors[l] || '#999'), borderWidth: 0 }]
       },
       options: {
         responsive: true, maintainAspectRatio: false,
@@ -390,31 +396,31 @@ async function loadDcaPlans() {
     const statusBadge = p.is_active ? '<span class="badge badge-green">进行中</span>' : '<span class="badge badge-gray">已暂停</span>';
     const pauseLabel = p.is_active ? '暂停' : '恢复';
     const pauseColor = p.is_active ? 'btn-xs' : 'btn-xs';
-    return `<div class="summary-card" style="padding:14px 18px;margin-bottom:8px;">
-      <div style="display:flex;justify-content:space-between;align-items:start;">
-        <div style="flex:1;">
-          <div style="font-weight:600;font-size:15px;">${p.asset_name}</div>
-          <div style="font-size:12px;color:var(--sumi-light);margin-top:2px;">
-            <span class="badge ${atypeBadge(p.asset_type)}">${atypeLabel(p.asset_type)}</span>
-            ${p.frequency ? ' · '+freqLabels[p.frequency] : ''} · 每期 ${p.currency==='USD'?'$':'¥'}${p.amount.toLocaleString()}${p.fees ? ' (费率'+(p.fees/p.amount*100).toFixed(2)+'%)' : ''}
+    const currSym = p.currency === 'USD' ? '$' : '¥';
+    return `<div class="summary-card" style="padding:10px 14px;margin-bottom:6px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;">
+        <div style="flex:1;min-width:0;">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">
+            <b style="font-size:14px;">${p.asset_name}</b>
+            <span class="badge ${atypeBadge(p.asset_type)}" style="font-size:10px;">${atypeLabel(p.asset_type)}</span>
+            ${statusBadge}
           </div>
-          <div style="display:flex;gap:24px;margin-top:10px;font-size:13px;">
-            <div><span style="color:var(--sumi-light);">已投</span> <b>${buys.length}期</b></div>
-            <div><span style="color:var(--sumi-light);">累计投入</span> <b>${p.currency==='USD'?'$':'¥'}${totalCost.toLocaleString()}</b></div>
-            <div><span style="color:var(--sumi-light);">累计份额</span> <b>${totalShares.toFixed(2)}</b></div>
-            <div><span style="color:var(--sumi-light);">均价</span> <b>${p.currency==='USD'?'$':'¥'}${avgCost.toFixed(2)}</b></div>
-            ${ret != null ? `<div><span style="color:var(--sumi-light);">收益率</span> <b class="${ret>=0?'diff-positive':'diff-negative'}">${ret>=0?'+':''}${ret.toFixed(2)}%</b></div>` : ''}
+          <div style="font-size:12px;color:var(--sumi-light);margin-bottom:6px;">
+            ${freqLabels[p.frequency]||p.frequency} · ${currSym}${p.amount.toLocaleString()}${p.fees ? ' · 费率'+(p.fees/p.amount*100).toFixed(2)+'%' : ''} · 下次 ${p.next_date}
+          </div>
+          <div style="display:flex;gap:16px;font-size:12px;flex-wrap:wrap;">
+            <span>已投 <b>${buys.length}期</b></span>
+            <span>投入 <b>${currSym}${totalCost.toLocaleString()}</b></span>
+            <span>份额 <b>${totalShares.toFixed(2)}</b></span>
+            <span>均价 <b>${currSym}${avgCost.toFixed(2)}</b></span>
+            ${ret != null ? `<span>收益 <b class="${ret>=0?'diff-positive':'diff-negative'}">${ret>=0?'+':''}${ret.toFixed(1)}%</b></span>` : ''}
           </div>
         </div>
-        <div style="text-align:right;white-space:nowrap;">
-          <div style="font-size:12px;color:var(--sumi-light);">下次: ${p.next_date}</div>
-          <div style="margin:4px 0;">${statusBadge}</div>
-          <div style="display:flex;gap:4px;justify-content:flex-end;margin-top:8px;">
-            <button class="btn btn-primary btn-xs" onclick="showExecuteDialog(${p.id})">立即定投</button>
-            <button class="btn btn-secondary btn-xs" onclick="editDca(${p.id})">编辑</button>
-            <button class="btn ${p.is_active ? 'btn-xs' : 'btn-xs'}" style="color:${p.is_active?'var(--kuchiba)':'var(--matcha)'};" onclick="toggleDca(${p.id},${p.is_active ? 0 : 1})">${pauseLabel}</button>
-            <button class="btn btn-danger btn-xs" onclick="deactivateDca(${p.id})">删除</button>
-          </div>
+        <div style="display:flex;gap:3px;flex-shrink:0;">
+          <button class="btn btn-primary btn-xs" onclick="showExecuteDialog(${p.id})" title="立即定投">定投</button>
+          <button class="btn btn-secondary btn-xs" onclick="editDca(${p.id})" title="编辑">编</button>
+          <button class="btn btn-xs" style="color:${p.is_active?'var(--kuchiba)':'var(--matcha)'};" onclick="toggleDca(${p.id},${p.is_active ? 0 : 1})" title="${pauseLabel}">${p.is_active?'⏸':'▶'}</button>
+          <button class="btn btn-danger btn-xs" onclick="deactivateDca(${p.id})" title="删除">✕</button>
         </div>
       </div>
     </div>`;
@@ -431,14 +437,29 @@ async function toggleDca(id, active) {
   toast(active ? '已恢复' : '已暂停', 'ok');
 }
 
+function onDcaModeChange() {
+  const mode = document.getElementById('dcaMode').value;
+  document.getElementById('dcaAmtLabel').parentElement.style.display = mode === 'amount' ? '' : 'none';
+  document.getElementById('dcaQtyField').style.display = mode === 'shares' ? '' : 'none';
+}
+function onDcaTypeChange() {
+  const t = document.getElementById('dcaAssetType').value;
+  const cur = { fund:'CNY', bond:'CNY', cash:'CNY', stock:'USD', etf:'USD', crypto:'USD', reit:'USD', other:'USD' };
+  document.getElementById('dcaCurr').value = cur[t] || 'USD';
+}
+function onDcaCurrChange(){}
+
 function showDcaForm() {
   document.getElementById('dcaEditId').value = '';
   document.getElementById('dcaAsset').value=''; document.getElementById('dcaAssetType').value='stock';
-  document.getElementById('dcaAmount').value=''; document.getElementById('dcaFees').value='0';
+  document.getElementById('dcaMode').value='amount'; document.getElementById('dcaAmount').value='';
+  document.getElementById('dcaQty').value=''; document.getElementById('dcaFeeRate').value='0';
   document.getElementById('dcaCurr').value='USD'; document.getElementById('dcaFreq').value='monthly';
+  document.getElementById('dcaStartDate').value=''; document.getElementById('dcaEndDate').value='';
   document.getElementById('dcaPlatform').value=''; document.getElementById('dcaAccount').value='';
   document.getElementById('dcaPayAccount').value='';
   document.getElementById('dcaNext').value = new Date().toISOString().slice(0,10);
+  onDcaModeChange();
   document.getElementById('dcaForm').style.display = 'block';
 }
 
@@ -448,23 +469,29 @@ async function editDca(id) {
   document.getElementById('dcaEditId').value = p.id;
   document.getElementById('dcaAsset').value = p.asset_name;
   document.getElementById('dcaAssetType').value = p.asset_type || 'stock';
+  document.getElementById('dcaMode').value = 'amount';
   document.getElementById('dcaAmount').value = p.amount;
-  document.getElementById('dcaFees').value = p.fees || 0;
+  document.getElementById('dcaFeeRate').value = p.amount > 0 ? ((p.fees || 0) / p.amount * 100).toFixed(2) : '0';
   document.getElementById('dcaCurr').value = p.currency;
   document.getElementById('dcaFreq').value = p.frequency;
+  document.getElementById('dcaStartDate').value = '';
+  document.getElementById('dcaEndDate').value = '';
   document.getElementById('dcaPlatform').value = p.platform || '';
   document.getElementById('dcaAccount').value = p.account_id || '';
   document.getElementById('dcaPayAccount').value = p.payment_account || '';
   document.getElementById('dcaNext').value = p.next_date;
+  onDcaModeChange();
   document.getElementById('dcaForm').style.display = 'block';
 }
 
 async function saveDca() {
+  const amount = parseFloat(document.getElementById('dcaAmount').value) || 0;
+  const feeRate = parseFloat(document.getElementById('dcaFeeRate').value) || 0;
   const body = {
     asset_name: document.getElementById('dcaAsset').value,
     asset_type: document.getElementById('dcaAssetType').value,
-    amount: parseFloat(document.getElementById('dcaAmount').value),
-    fees: parseFloat(document.getElementById('dcaFees').value) || 0,
+    amount: amount,
+    fees: Math.round(amount * feeRate / 100 * 100) / 100,
     currency: document.getElementById('dcaCurr').value || 'USD',
     frequency: document.getElementById('dcaFreq').value,
     next_date: document.getElementById('dcaNext').value,
@@ -472,7 +499,7 @@ async function saveDca() {
     account_id: document.getElementById('dcaAccount').value ? parseInt(document.getElementById('dcaAccount').value) : null,
     payment_account: document.getElementById('dcaPayAccount').value ? parseInt(document.getElementById('dcaPayAccount').value) : null,
   };
-  if (!body.asset_name || isNaN(body.amount) || !body.next_date) return toast('请填写标的、金额、日期', 'err');
+  if (!body.asset_name || !body.amount || !body.next_date) return toast('请填写标的、金额、日期', 'err');
   const editId = document.getElementById('dcaEditId').value;
   const url = editId ? `/api/dca-plans/${editId}` : '/api/dca-plans';
   const method = editId ? 'PUT' : 'POST';
