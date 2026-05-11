@@ -127,7 +127,16 @@ let investAccounts = [], allAccounts = [];
 async function autoFillName(inputEl) {
   const code = inputEl.value.trim().toUpperCase();
   if (!code || code.length < 2) return;
+  inputEl.placeholder = '查询中…';
   try {
+    // Auto-detect: digits = A-share → CNY, letters = US → USD
+    if (/^\d+$/.test(code)) {
+      document.getElementById('dcaCurr').value = 'CNY';
+      if (document.getElementById('dcaAssetType').value === 'stock') document.getElementById('dcaAssetType').value = 'fund';
+    } else if (/^[A-Z]+$/.test(code)) {
+      document.getElementById('dcaCurr').value = 'USD';
+      document.getElementById('dcaAssetType').value = 'stock';
+    }
     // Check portfolio cache for name
     const r = await fetch('/api/portfolio');
     const d = await r.json();
@@ -136,7 +145,15 @@ async function autoFillName(inputEl) {
       inputEl.placeholder = h.display_name;
       return;
     }
-  } catch(e) {}
+    // Try yfinance for name
+    try {
+      const yr = await fetch(`https://query1.finance.yahoo.com/v1/finance/search?q=${code}`);
+      const yd = await yr.json();
+      const quote = (yd.quotes || []).find(q => q.symbol === code);
+      if (quote && quote.longname) inputEl.placeholder = quote.longname;
+      else if (quote && quote.shortname) inputEl.placeholder = quote.shortname;
+    } catch(e) {}
+  } catch(e) { inputEl.placeholder = code; }
 }
 
 async function init() {
@@ -354,6 +371,11 @@ async function loadDcaPlans() {
   }
   // Use existing investment data from loadInvestments
   let allRecs = window._allInvestments || [];
+  // Fetch portfolio for current prices
+  let pxMap = {};
+  try { const pr = await fetch('/api/portfolio'); const pd = await pr.json();
+    (pd.holdings || []).forEach(h => { pxMap[h.asset_name] = h.current_price || 0; });
+  } catch(e) {}
   const freqLabels = { daily:'每日', weekly:'每周', biweekly:'双周', monthly:'每月' };
   document.getElementById('dcaList').innerHTML = allDcaPlans.map(p => {
     // Compute stats: find buy records matching this plan's asset
@@ -362,6 +384,10 @@ async function loadDcaPlans() {
     const totalFees = buys.reduce((s, r) => s + (r.fees || 0), 0);
     const totalShares = buys.reduce((s, r) => s + (r.quantity || 0), 0);
     const avgCost = totalShares > 0 ? totalCost / totalShares : 0;
+    const curPx = pxMap[p.asset_name] || 0;
+    const curVal = totalShares * curPx;
+    const pnl = curVal - totalCost;
+    const ret = totalCost > 0 ? (pnl / totalCost * 100) : null;
     const currSym = p.currency === 'USD' ? '$' : '¥';
     const statusTag = p.is_active ? '<span class="badge badge-green">进行中</span>' : '<span class="badge badge-gray">已暂停</span>';
     return `<div class="summary-card" style="padding:12px 16px;margin-bottom:8px;">
@@ -371,12 +397,13 @@ async function loadDcaPlans() {
           <div style="font-size:12px;color:var(--sumi-light);margin-bottom:6px;">
             ${freqLabels[p.frequency]||p.frequency} · ${currSym}${p.amount.toLocaleString()}${p.fees ? ' · 费率'+(p.fees/p.amount*100).toFixed(2)+'%' : ''} · 下次 ${p.next_date}
           </div>
-          <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:4px 20px;font-size:13px;">
+          <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:4px 16px;font-size:13px;">
             <div><span style="color:var(--sumi-light);">已投期数</span> <b>${buys.length}</b></div>
             <div><span style="color:var(--sumi-light);">累计投入</span> <b>${currSym}${totalCost.toLocaleString()}</b></div>
-            <div><span style="color:var(--sumi-light);">手续费</span> <b>${currSym}${totalFees.toLocaleString()}</b></div>
             <div><span style="color:var(--sumi-light);">累计份额</span> <b>${totalShares.toFixed(4)}</b></div>
             <div><span style="color:var(--sumi-light);">平均成本</span> <b>${currSym}${avgCost.toFixed(2)}</b></div>
+            ${curPx > 0 ? `<div><span style="color:var(--sumi-light);">当前市值</span> <b>${currSym}${Math.round(curVal).toLocaleString()}</b></div>` : ''}
+            ${ret != null ? `<div><span style="color:var(--sumi-light);">收益率</span> <b class="${ret>=0?'diff-positive':'diff-negative'}">${ret>=0?'+':''}${ret.toFixed(2)}%</b></div>` : ''}
           </div>
         </div>
         <div style="display:flex;gap:4px;flex-shrink:0;margin-left:12px;">
@@ -468,15 +495,29 @@ async function editDca(id) {
 async function saveDca() {
   const amount = parseFloat(document.getElementById('dcaAmount').value) || 0;
   const feeRate = parseFloat(document.getElementById('dcaFeeRate').value) || 0;
-  const startDate = document.getElementById('dcaStartDate').value || new Date().toISOString().slice(0,10);
+  // Auto-compute next_date from start_date + frequency
+  const freq = document.getElementById('dcaFreq').value;
+  let nextDate = startDate;
+  const today = new Date().toISOString().slice(0,10);
+  if (startDate < today) {
+    const s = new Date(startDate);
+    const n = new Date();
+    while (s <= n) {
+      if (freq === 'daily') s.setDate(s.getDate() + 1);
+      else if (freq === 'weekly') s.setDate(s.getDate() + 7);
+      else if (freq === 'biweekly') s.setDate(s.getDate() + 14);
+      else s.setMonth(s.getMonth() + 1);
+    }
+    nextDate = s.toISOString().slice(0,10);
+  }
   const body = {
     asset_name: document.getElementById('dcaAsset').value,
     asset_type: document.getElementById('dcaAssetType').value,
     amount: amount,
     fees: Math.round(amount * feeRate / 100 * 100) / 100,
     currency: document.getElementById('dcaCurr').value || 'USD',
-    frequency: document.getElementById('dcaFreq').value,
-    next_date: startDate,
+    frequency: freq,
+    next_date: nextDate,
     platform: document.getElementById('dcaPlatform').value,
     account_id: document.getElementById('dcaAccount').value ? parseInt(document.getElementById('dcaAccount').value) : null,
     payment_account: document.getElementById('dcaPayAccount').value ? parseInt(document.getElementById('dcaPayAccount').value) : null,
