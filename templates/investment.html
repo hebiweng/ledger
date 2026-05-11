@@ -124,36 +124,64 @@ function atypeLabel(t) { return atypeLabels[t] || t; }
 function atypeBadge(t) { return atypeColors[t] || 'badge-gray'; }
 let investAccounts = [], allAccounts = [];
 
+// 内置代码-名称映射表
+const KNOWN_TICKERS = {
+  // A股 ETF
+  '510050':'华夏上证50ETF', '510300':'华泰柏瑞沪深300ETF', '510500':'南方中证500ETF',
+  '159915':'易方达创业板ETF', '588000':'华夏科创50ETF', '512880':'国泰中证证券ETF',
+  '512100':'南方中证1000ETF', '159949':'华安创业板50ETF',
+  // A股 场外基金
+  '016452':'易方达上证科创50联接A', '110020':'易方达沪深300联接A',
+  '001632':'天弘中证食品饮料A', '161725':'招商中证白酒A',
+  // 美股
+  'QQQ':'Invesco QQQ Trust', 'SPY':'SPDR S&P 500 ETF', 'TQQQ':'ProShares UltraPro QQQ',
+  'QLD':'ProShares Ultra QQQ', 'AAPL':'Apple Inc.', 'MSFT':'Microsoft Corp.',
+  'GOOGL':'Alphabet Inc.', 'NVDA':'NVIDIA Corp.', 'AMZN':'Amazon.com Inc.',
+  'META':'Meta Platforms Inc.', 'TSLA':'Tesla Inc.', 'GGLL':'Direxion GOOGL Bull 2X',
+  'QQQM':'Invesco Nasdaq 100', 'SOXL':'Direxion Semiconductor Bull 3X',
+};
+
 async function autoFillName(inputEl) {
   const code = inputEl.value.trim().toUpperCase();
   if (!code || code.length < 2) return;
   inputEl.placeholder = '查询中…';
+  // 1. Check built-in mapping
+  if (KNOWN_TICKERS[code]) { inputEl.placeholder = KNOWN_TICKERS[code]; }
+  else if (KNOWN_TICKERS[code.toUpperCase()]) { inputEl.placeholder = KNOWN_TICKERS[code.toUpperCase()]; }
+
+  // 2. Auto-detect: digits = A-share → CNY/fund, letters = US → USD/stock
+  if (/^\d+$/.test(code)) {
+    document.getElementById('dcaCurr').value = 'CNY';
+    document.getElementById('dcaAssetType').value = 'fund';
+  } else if (/^[A-Z]+$/.test(code)) {
+    document.getElementById('dcaCurr').value = 'USD';
+    document.getElementById('dcaAssetType').value = 'stock';
+  }
+
+  // 3. Try to fetch latest price
   try {
-    // Auto-detect: digits = A-share → CNY, letters = US → USD
-    if (/^\d+$/.test(code)) {
-      document.getElementById('dcaCurr').value = 'CNY';
-      if (document.getElementById('dcaAssetType').value === 'stock') document.getElementById('dcaAssetType').value = 'fund';
-    } else if (/^[A-Z]+$/.test(code)) {
-      document.getElementById('dcaCurr').value = 'USD';
-      document.getElementById('dcaAssetType').value = 'stock';
-    }
-    // Check portfolio cache for name
     const r = await fetch('/api/portfolio');
     const d = await r.json();
     const h = (d.holdings || []).find(h => h.asset_name.toUpperCase() === code);
-    if (h && h.display_name && h.display_name !== code) {
+    if (h && h.display_name && h.display_name !== code && !inputEl.placeholder.includes('查询')) {
       inputEl.placeholder = h.display_name;
-      return;
     }
-    // Try yfinance for name
-    try {
-      const yr = await fetch(`https://query1.finance.yahoo.com/v1/finance/search?q=${code}`);
-      const yd = await yr.json();
-      const quote = (yd.quotes || []).find(q => q.symbol === code);
-      if (quote && quote.longname) inputEl.placeholder = quote.longname;
-      else if (quote && quote.shortname) inputEl.placeholder = quote.shortname;
-    } catch(e) {}
-  } catch(e) { inputEl.placeholder = code; }
+    if (h && h.current_price) {
+      const px = h.current_price;
+      const amt = parseFloat(document.getElementById('dcaAmount').value) || 0;
+      const feeRate = parseFloat(document.getElementById('dcaFeeRate').value) || 0;
+      const mode = document.getElementById('dcaMode').value;
+      if (mode === 'amount' && amt > 0 && px > 0) {
+        const fee = amt * feeRate / 100;
+        const qty = (amt - fee) / px;
+        document.getElementById('dcaAmount').title = `可购约 ${qty.toFixed(4)} 股 @ $${px}`;
+      } else if (mode === 'shares') {
+        const qty = parseFloat(document.getElementById('dcaQty').value) || 0;
+        const needAmt = qty * px * (1 + feeRate/100);
+        document.getElementById('dcaQty').title = `约需 ${needAmt.toFixed(2)} @ $${px}`;
+      }
+    }
+  } catch(e) {}
 }
 
 async function init() {
@@ -181,6 +209,7 @@ async function init() {
   await startAutoRefresh();
   await loadBalances();
   await loadInvestments();  // populates window._allInvestments
+  await autoExecuteDca();   // check and execute due DCA plans
   await loadDcaPlans();     // uses cached investment data
   await loadSummary();
 }
@@ -429,6 +458,25 @@ async function loadDcaPlans() {
       </div>
     </div>`;
   }).join('');
+}
+
+async function autoExecuteDca() {
+  try {
+    const r = await fetch('/api/dca-plans');
+    const plans = await r.json();
+    const today = new Date().toISOString().slice(0,10);
+    const activePlans = plans.filter(p => p.is_active && p.next_date <= today);
+    let executed = 0;
+    for (const p of activePlans) {
+      // Check if already executed today
+      const recs = window._allInvestments || [];
+      const alreadyDone = recs.some(r => r.asset_name === p.asset_name && r.date === today && r.notes && r.notes.includes('定投'));
+      if (alreadyDone) continue;
+      await fetch(`/api/dca-plans/${p.id}/execute`, { method: 'POST' });
+      executed++;
+    }
+    if (executed > 0) { toast(`自动执行 ${executed} 笔定投`, 'ok'); loadInvestments(); }
+  } catch(e) {}
 }
 
 async function backfillDca(id) {
