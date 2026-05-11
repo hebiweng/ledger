@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block content %}
+<script>window._preload = JSON.parse('{{ preload | safe }}');</script>
+
+<div class="card"><div class="card-header">投资总览</div><div class="summary-grid" id="sum"></div></div>
+<div class="card"><div class="card-header">持仓组合</div><table><thead><tr><th>代码</th><th>类型</th><th>数量</th><th>成本</th><th>均价</th><th>手续费</th></tr></thead><tbody id="hold"></tbody></table></div>
+<div class="card"><div class="card-header">交易记录</div><table><thead><tr><th>日期</th><th>类型</th><th>标的</th><th>数量</th><th>单价</th><th>金额</th></tr></thead><tbody id="trades"></tbody></table></div>
+<div class="card"><div class="card-header">定投计划</div><div id="dca"></div></div>
+
+<script>
+const P=window._preload, T={stock:'股票',etf:'ETF',fund:'基金'}, F={daily:'每日',weekly:'每周',monthly:'每月'};
+(function render(){
+  var s=P.portfolio;
+  document.getElementById('sum').innerHTML='<div class="summary-card"><div class="label">总成本</div><div class="value">¥' + s.total_cost_cny.toLocaleString() + '</div></div><div class="summary-card"><div class="label">持仓标的</div><div class="value">' + s.holdings.length + '个</div></div>';
+  document.getElementById('hold').innerHTML = s.holdings.length ? s.holdings.map(function(h){
+    return '<tr><td><b>' + h.asset_name + '</b></td><td>' + (T[h.asset_type]||h.asset_type) + '</td><td class="num-col">' + h.quantity.toLocaleString() + '</td><td class="num-col">' + h.currency + ' ' + h.total_cost.toLocaleString() + '</td><td class="num-col">' + h.currency + ' ' + h.avg_cost.toLocaleString() + '</td><td class="num-col">' + h.currency + ' ' + h.total_fees.toLocaleString() + '</td></tr>';
+  }).join('') : '<tr><td colspan="6">暂无持仓</td></tr>';
+  document.getElementById('trades').innerHTML = P.investments.length ? P.investments.map(function(r){
+    return '<tr><td>' + r.date + '</td><td>' + r.type + '</td><td>' + r.asset_name + '</td><td class="num-col">' + (r.quantity||'—') + '</td><td class="num-col">' + (r.price||'—') + '</td><td class="num-col">' + r.currency + ' ' + r.total_amount.toLocaleString() + '</td></tr>';
+  }).join('') : '<tr><td colspan="6">暂无交易</td></tr>';
+  document.getElementById('dca').innerHTML = P.dca.length ? P.dca.map(function(p){
+    return '<div class="summary-card" style="padding:8px 12px;margin-bottom:4px"><b>' + p.asset_name + '</b> ' + (T[p.asset_type]||p.asset_type) + ' · ' + (F[p.frequency]||p.frequency) + ' ' + p.currency + ' ' + p.amount.toLocaleString() + ' · ' + p.next_date + ' ' + (p.is_active?'<span class="badge badge-green">进行中</span>':'<span class="badge badge-gray">停</span>') + '</div>';
+  }).join('') : '暂无定投';
+})();
+</script>
+{% endblock %}

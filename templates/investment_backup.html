@@ -33,7 +33,7 @@
 </div>
 
 <!-- Charts -->
-<div class="card" id="pfCharts">
+<div class="card" id="pfCharts" style="display:none;">
   <div class="card-header">投资分析</div>
   <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
     <div><div class="chart-wrap" style="height:260px;"><canvas id="chartTypePie"></canvas></div></div>
@@ -148,7 +148,15 @@ async function autoFillName(inputEl) {
       inputEl.placeholder = h.display_name;
       return;
     }
-  } catch(e) {}
+    // Try yfinance for name
+    try {
+      const yr = await fetch(`https://query1.finance.yahoo.com/v1/finance/search?q=${code}`);
+      const yd = await yr.json();
+      const quote = (yd.quotes || []).find(q => q.symbol === code);
+      if (quote && quote.longname) inputEl.placeholder = quote.longname;
+      else if (quote && quote.shortname) inputEl.placeholder = quote.shortname;
+    } catch(e) {}
+  } catch(e) { inputEl.placeholder = code; }
 }
 
 async function init() {
@@ -396,7 +404,7 @@ function startAutoRefresh() {
   portfolioTimer = setInterval(() => {
     if (document.visibilityState === 'visible') loadPortfolio(false);
   }, 60000);
-  // Initial render is done by renderPreloaded — don't overwrite
+  loadPortfolio(false);  // initial load from cache
 }
 
 function stopAutoRefresh() {

@@ -71,10 +71,139 @@ def page_expenses():
     return HTMLResponse(tpl.render(nav="expenses"))
 
 
+@app.get("/investment2", response_class=HTMLResponse)
+def page_investment2(db: Session = Depends(get_db)):
+    tpl = jinja_env.get_template("investment2.html")
+    return HTMLResponse(tpl.render(nav="investment2", preload="{}"))
+
+@app.get("/investment3", response_class=HTMLResponse)
+def page_investment3(db: Session = Depends(get_db)):
+    # Reuse same preload data as main investment page
+    import json as _json
+    now = datetime.now()
+    # Accounts
+    type_order = {"bank": 0, "credit": 1, "ewallet": 2, "investment": 3, "topup": 4, "loan": 5, "cash": 6}
+    accounts = db.query(Account).filter(Account.is_active == 1, Account.parent_id == None).all()
+    accounts.sort(key=lambda a: (type_order.get(a.type, 99), a.sort_order))
+    accounts_data = [{"id": a.id, "name": a.name, "type": a.type, "currency": a.currency, "is_active": a.is_active} for a in accounts]
+    # Investment records
+    inv_rows = db.query(InvestmentRecord).order_by(InvestmentRecord.date.desc()).all()
+    investments_data = [{"id": r.id, "date": r.date, "type": r.type, "asset_name": r.asset_name, "asset_type": r.asset_type, "quantity": r.quantity, "price": r.price, "fees": r.fees, "total_amount": r.total_amount, "currency": r.currency, "platform": r.platform or "", "account_id": r.account_id, "notes": r.notes or ""} for r in inv_rows]
+    # DCA
+    dca_rows = db.query(DcaPlan).order_by(DcaPlan.is_active.desc(), DcaPlan.next_date).all()
+    dca_data = [{"id": r.id, "asset_name": r.asset_name, "asset_type": r.asset_type, "amount": r.amount, "fees": r.fees or 0, "currency": r.currency, "frequency": r.frequency, "next_date": r.next_date, "is_active": r.is_active} for r in dca_rows]
+    # Balances
+    month_bals = db.query(MonthlyBalance).filter(MonthlyBalance.year == now.year, MonthlyBalance.month == now.month).all()
+    bal_map = {}
+    for mb in month_bals: bal_map[mb.account_id] = {"balance": mb.balance, "currency": "CNY"}
+    # Portfolio
+    holdings = {}
+    for r in inv_rows:
+        if r.type not in ("buy", "sell"): continue
+        key = r.asset_name
+        if key not in holdings: holdings[key] = {"asset_name": key, "asset_type": r.asset_type, "currency": r.currency, "quantity": 0, "total_cost": 0, "total_fees": 0}
+        if r.type == "buy":
+            holdings[key]["quantity"] += (r.quantity or 0)
+            holdings[key]["total_cost"] += r.total_amount + (r.fees or 0)
+            holdings[key]["total_fees"] += (r.fees or 0)
+        else:
+            holdings[key]["quantity"] -= (r.quantity or 0)
+            holdings[key]["total_cost"] -= r.total_amount - (r.fees or 0)
+    portfolio_holdings = []
+    total_cost_cny = 0.0
+    for h in holdings.values():
+        if h["quantity"] <= 0: continue
+        avg = h["total_cost"] / h["quantity"]
+        total_cost_cny += h["total_cost"]
+        portfolio_holdings.append({"asset_name": h["asset_name"], "asset_type": h["asset_type"], "currency": h["currency"], "quantity": round(h["quantity"], 4), "total_cost": round(h["total_cost"], 2), "avg_cost": round(avg, 2), "total_fees": round(h["total_fees"], 2)})
+    embedded = _json.dumps({"accounts": accounts_data, "investments": investments_data, "dca": dca_data, "balances": bal_map, "portfolio": {"holdings": portfolio_holdings, "total_cost_cny": round(total_cost_cny, 2)}, "today": now.strftime("%Y-%m-%d")}, ensure_ascii=False)
+    tpl = jinja_env.get_template("investment3.html")
+    return HTMLResponse(tpl.render(nav="investment3", preload=embedded))
+
 @app.get("/investment", response_class=HTMLResponse)
-def page_investment():
+def page_investment(db: Session = Depends(get_db)):
+    import json as _json
+
+    # Accounts
+    type_order = {"bank": 0, "credit": 1, "ewallet": 2, "investment": 3, "topup": 4, "loan": 5, "cash": 6}
+    accounts = db.query(Account).filter(Account.is_active == 1, Account.parent_id == None).all()
+    accounts.sort(key=lambda a: (type_order.get(a.type, 99), a.sort_order))
+    accounts_data = [{"id": a.id, "name": a.name, "type": a.type, "currency": a.currency} for a in accounts]
+
+    # Investment records
+    inv_rows = db.query(InvestmentRecord).order_by(InvestmentRecord.date.desc()).all()
+    investments_data = [{
+        "id": r.id, "date": r.date, "type": r.type, "asset_name": r.asset_name,
+        "asset_type": r.asset_type, "quantity": r.quantity, "price": r.price,
+        "fees": r.fees, "total_amount": r.total_amount, "currency": r.currency,
+        "platform": r.platform, "account_id": r.account_id, "notes": r.notes,
+    } for r in inv_rows]
+
+    # DCA plans
+    dca_rows = db.query(DcaPlan).order_by(DcaPlan.is_active.desc(), DcaPlan.next_date).all()
+    dca_data = [{
+        "id": r.id, "asset_name": r.asset_name, "asset_type": r.asset_type,
+        "amount": r.amount, "fees": r.fees, "currency": r.currency,
+        "frequency": r.frequency, "next_date": r.next_date, "is_active": r.is_active,
+        "platform": r.platform, "account_id": r.account_id, "payment_account": r.payment_account,
+    } for r in dca_rows]
+
+    # Balances (current month)
+    now = datetime.now()
+    month_bals = db.query(MonthlyBalance).filter(
+        MonthlyBalance.year == now.year, MonthlyBalance.month == now.month
+    ).all()
+    bal_map = {}
+    for mb in month_bals:
+        acc = db.query(Account).filter(Account.id == mb.account_id).first()
+        bal_map[mb.account_id] = {"balance": mb.balance, "currency": acc.currency if acc else "CNY"}
+
+    # Portfolio holdings (from investment records, no external prices)
+    holdings = {}
+    for r in inv_rows:
+        if r.type not in ("buy", "sell"): continue
+        key = r.asset_name
+        if key not in holdings:
+            holdings[key] = {"asset_name": key, "asset_type": r.asset_type, "currency": r.currency, "quantity": 0, "total_cost": 0, "total_fees": 0}
+        if r.type == "buy":
+            holdings[key]["quantity"] += (r.quantity or 0)
+            holdings[key]["total_cost"] += r.total_amount + (r.fees or 0)
+            holdings[key]["total_fees"] += (r.fees or 0)
+        else:
+            holdings[key]["quantity"] -= (r.quantity or 0)
+            holdings[key]["total_cost"] -= r.total_amount - (r.fees or 0)
+
+    portfolio_holdings = []
+    total_cost_cny = 0.0
+    for h in holdings.values():
+        if h["quantity"] <= 0: continue
+        avg = h["total_cost"] / h["quantity"]
+        conv = convert_to_cny(h["total_cost"], h["currency"], db)
+        cost_cny = round(conv["value"], 2) if conv["valid"] else 0
+        total_cost_cny += cost_cny
+        portfolio_holdings.append({
+            "asset_name": h["asset_name"], "asset_type": h["asset_type"],
+            "currency": h["currency"], "quantity": round(h["quantity"], 4),
+            "total_cost": round(h["total_cost"], 2), "avg_cost": round(avg, 2),
+            "total_cost_cny": cost_cny, "total_fees": round(h["total_fees"], 2),
+        })
+
+    # Exchange rates
+    rates_rows = db.query(ExchangeRate).all()
+    rates_data = [{"from": r.from_currency, "to": r.to_currency, "rate": r.rate} for r in rates_rows]
+
+    embedded = _json.dumps({
+        "accounts": accounts_data,
+        "investments": investments_data,
+        "dca": dca_data,
+        "balances": bal_map,
+        "portfolio": {"holdings": portfolio_holdings, "total_cost_cny": round(total_cost_cny, 2)},
+        "rates": rates_data,
+        "today": now.strftime("%Y-%m-%d"),
+    }, ensure_ascii=False)
+
     tpl = jinja_env.get_template("investment.html")
-    return HTMLResponse(tpl.render(nav="investment"))
+    return HTMLResponse(tpl.render(nav="investment", preload=embedded))
 
 
 @app.get("/accounts", response_class=HTMLResponse)
@@ -985,6 +1114,7 @@ def api_investment_delete(inv_id: int, db: Session = Depends(get_db)):
 # ── Portfolio API ───────────────────────────────────────
 
 PORTFOLIO_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache", "portfolio_prices.json")
+_portfolio_full_cache = None  # full response cache for instant loads
 
 def _is_market_open() -> bool:
     """Return True if US market is currently open (Mon-Fri 9:30-16:00 ET)."""
@@ -1067,11 +1197,8 @@ def api_portfolio(refresh: bool = False, db: Session = Depends(get_db)):
         }
         ticker = h["asset_name"]
         cached = cache.get(ticker)
-        # Determine if we should fetch: refresh requested, no cache, or market open + stale cache
-        should_fetch = need_refresh or not cached
-        if not should_fetch and cached:
-            if _is_market_open() and not _is_same_trading_day(cached.get("ts", 0)):
-                should_fetch = True  # market open but cache is from previous session
+        # Only fetch external prices when user explicitly clicks "refresh"
+        should_fetch = need_refresh
 
         if should_fetch:
             price, price_cny, name, change_pct = _fetch_price(
@@ -1084,10 +1211,12 @@ def api_portfolio(refresh: bool = False, db: Session = Depends(get_db)):
                 price, name, change_pct = cached["price"], cached.get("name"), cached.get("change_pct")
             else:
                 price = None
-        else:
+        elif cached:
             price = cached["price"]
             name = cached.get("name")
             change_pct = cached.get("change_pct")
+        else:
+            price = None
 
         if price is not None:
             item["display_name"] = name
@@ -1100,7 +1229,7 @@ def api_portfolio(refresh: bool = False, db: Session = Depends(get_db)):
                 item["change_pct"] = change_pct
         result.append(item)
 
-    if need_refresh:
+    if cache:
         _save_portfolio_cache(cache)
 
     # ── Portfolio summary (all values in CNY) ────────
@@ -1152,13 +1281,42 @@ def api_portfolio(refresh: bool = False, db: Session = Depends(get_db)):
     return {"holdings": result, "summary": summary}
 
 
+PERFORMANCE_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache", "performance_cache.json")
+
+
+def _load_performance_cache():
+    if os.path.exists(PERFORMANCE_CACHE_FILE):
+        try:
+            with open(PERFORMANCE_CACHE_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def _save_performance_cache(data):
+    os.makedirs(os.path.dirname(PERFORMANCE_CACHE_FILE), exist_ok=True)
+    data["ts"] = datetime.now().timestamp()
+    with open(PERFORMANCE_CACHE_FILE, "w") as f:
+        json.dump(data, f)
+
+
 @app.get("/api/portfolio/performance")
-def api_portfolio_performance(db: Session = Depends(get_db)):
+def api_portfolio_performance(refresh: bool = False, db: Session = Depends(get_db)):
     """Return daily portfolio value + QQQ/SPY benchmarks since first transaction."""
     from datetime import datetime as _dt, timedelta as _td
     import yfinance as _yf
     import pandas as _pd
     import math as _math
+
+    # Use cache when available and not forcing refresh
+    if not refresh:
+        cached = _load_performance_cache()
+        if cached.get("dates"):
+            cache_ts = cached.get("ts", 0)
+            if not _is_market_open() or _is_same_trading_day(cache_ts):
+                return {"dates": cached["dates"], "portfolio": cached["portfolio"],
+                        "qqq": cached.get("qqq", []), "spy": cached.get("spy", [])}
 
     rows = db.query(InvestmentRecord).order_by(InvestmentRecord.date).all()
     if not rows:
@@ -1182,6 +1340,11 @@ def api_portfolio_performance(db: Session = Depends(get_db)):
             pass
 
     if not closes:
+        # Return cached data as fallback
+        cached = _load_performance_cache()
+        if cached.get("dates"):
+            return {"dates": cached["dates"], "portfolio": cached["portfolio"],
+                    "qqq": cached.get("qqq", []), "spy": cached.get("spy", [])}
         return {"dates": [], "portfolio": [], "qqq": [], "spy": []}
 
     # Build combined price index
@@ -1246,7 +1409,9 @@ def api_portfolio_performance(db: Session = Depends(get_db)):
         spy0 = float(closes["SPY"].iloc[0])
         spy_pct = [round((float(closes["SPY"].iloc[i]) / spy0 - 1) * 100, 2) for i in range(len(df))]
 
-    return {"dates": dates, "portfolio": port_pct, "qqq": qqq_pct, "spy": spy_pct}
+    result = {"dates": dates, "portfolio": port_pct, "qqq": qqq_pct, "spy": spy_pct}
+    _save_performance_cache(result)
+    return result
 
 
 def _resolve_secid(symbol: str, asset_type: str = "stock") -> str | None:
