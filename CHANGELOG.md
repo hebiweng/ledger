@@ -48,8 +48,7 @@
 - 总资产 = 非投资余额 + 投资组合市值
 - 口径需要进一步对齐
 
-### linter/formatter 干扰
-- 有个外部工具持续自动修改 investment.html 的 JS 代码
-- 导致函数名被改写、调用链断裂
-- 未知来源，无配置文件（.prettier/.editorconfig 均不存在）
-- 疑似 Claude Code 系统内部机制
+### linter/formatter 干扰 ✅ 已排查
+- 系统提示 "modified by a linter" 经排查无任何外部 formatter/linter
+- 无 prettier/eslint/.editorconfig 等配置文件
+- 确认为 Claude Code 内部文件变更通知，不影响代码逻辑
