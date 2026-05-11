@@ -272,9 +272,10 @@ async function loadPortfolio(refresh) {
     document.getElementById('sumCount').textContent = summary.holdings_count + ' 个';
     document.getElementById('sumFees').textContent = summary.total_fees_cny != null ? '¥' + summary.total_fees_cny.toLocaleString() : '¥0';
 
-  // Render charts
+  // Render charts (performance chart loads only on explicit refresh)
   renderTypePie(holdings);
-  loadPerformanceChart();
+  // Refresh exchange rates too
+  fetch('/api/exchange-rates/refresh', {method:'POST'});
   }
 
   function renderTypePie(holdings) {
