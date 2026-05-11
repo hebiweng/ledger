@@ -192,8 +192,8 @@ async function init() {
 
   await startAutoRefresh();
   await loadBalances();
-  await loadInvestments();
-  await loadDcaPlans();
+  await loadInvestments();  // populates window._allInvestments
+  await loadDcaPlans();     // uses cached investment data
   await loadSummary();
 }
 
@@ -381,8 +381,8 @@ async function loadDcaPlans() {
     document.getElementById('dcaList').innerHTML = '<div style="color:var(--sumi-light);font-size:13px;">暂无定投计划</div>';
     return;
   }
-  // Fetch related investment records for stats
-  const ir = await fetch('/api/investments'); const allRecs = await ir.json();
+  // Use existing investment data from loadInvestments
+  let allRecs = window._allInvestments || [];
   const freqLabels = { daily:'每日', weekly:'每周', biweekly:'双周', monthly:'每月' };
   document.getElementById('dcaList').innerHTML = allDcaPlans.map(p => {
     // Compute stats: find buy records matching this plan's asset
@@ -417,7 +417,8 @@ async function loadDcaPlans() {
           </div>
         </div>
         <div style="display:flex;gap:3px;flex-shrink:0;">
-          <button class="btn btn-primary btn-xs" onclick="showExecuteDialog(${p.id})" title="立即定投">定投</button>
+          <button class="btn btn-primary btn-xs" onclick="showExecuteDialog(${p.id})" title="立即定投">投</button>
+          <button class="btn btn-xs" style="color:var(--matcha);" onclick="backfillDca(${p.id})" title="补投历史">补</button>
           <button class="btn btn-secondary btn-xs" onclick="editDca(${p.id})" title="编辑">编</button>
           <button class="btn btn-xs" style="color:${p.is_active?'var(--kuchiba)':'var(--matcha)'};" onclick="toggleDca(${p.id},${p.is_active ? 0 : 1})" title="${pauseLabel}">${p.is_active?'⏸':'▶'}</button>
           <button class="btn btn-danger btn-xs" onclick="deactivateDca(${p.id})" title="删除">✕</button>
@@ -425,6 +426,23 @@ async function loadDcaPlans() {
       </div>
     </div>`;
   }).join('');
+}
+
+async function backfillDca(id) {
+  const plan = allDcaPlans.find(p => p.id === id);
+  if (!plan) return;
+  const startDate = prompt('补投开始日期（YYYY-MM-DD）：', plan.next_date);
+  if (!startDate) return;
+  showConfirm('历史补投', `将从 ${startDate} 补投至今的${plan.asset_name}定投记录。`, async () => {
+    const r = await fetch(`/api/dca-plans/${id}/backfill?start_date=${startDate}`, { method: 'POST' });
+    const result = await r.json();
+    if (result.ok) {
+      toast(`已补投 ${result.count}/${result.dates} 期`, 'ok');
+      loadDcaPlans(); loadInvestments(); loadPortfolio(true);
+    } else {
+      toast('补投失败: ' + (result.detail || '未知错误'), 'err');
+    }
+  });
 }
 
 async function toggleDca(id, active) {
@@ -626,6 +644,7 @@ async function loadInvestments() {
   const type = document.getElementById('invFilterType').value;
   let url = '/api/investments?'; if (year) url += `year=${year}&`; if (type) url += `type=${type}&`;
   const r = await fetch(url); const data = await r.json();
+  window._allInvestments = data;
   const typeLabels = { buy: '买入', sell: '卖出', dividend: '分红', deposit: '入金', withdraw: '出金', dca_buy: '定投' };
   const typeColors = { buy: 'badge-blue', sell: 'badge-red', dividend: 'badge-green', deposit: 'badge-gray', withdraw: 'badge-gray', dca_buy: 'badge-blue' };
   document.getElementById('invList').innerHTML = data.map(inv => `<tr>
@@ -652,14 +671,13 @@ async function deleteInvestment(id) {
 
 async function loadBalances() {
   const now = new Date();
-  const [br, pr, ir] = await Promise.all([
+  const [br, pr] = await Promise.all([
     fetch(`/api/balances?year=${now.getFullYear()}&month=${now.getMonth()+1}`),
-    fetch('/api/portfolio'),
-    fetch('/api/investments')
+    fetch('/api/portfolio')
   ]);
   const data = await br.json();
   const pfData = await pr.json();
-  const allInvRecs = await ir.json();
+  const allInvRecs = window._allInvestments || [];
 
   const invItems = data.items.filter(it => it.type === 'investment');
   if (invItems.length === 0) {

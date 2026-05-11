@@ -763,6 +763,80 @@ def api_dca_execute(plan_id: int, price: float | None = None, note: str | None =
     return {"ok": True, "investment_id": inv.id, "next_date": plan.next_date, "balance_ok": balance_ok}
 
 
+@app.post("/api/dca-plans/{plan_id}/backfill")
+def api_dca_backfill(plan_id: int, start_date: str = None, db: Session = Depends(get_db)):
+    """Generate historical buy records for a DCA plan from start_date to today."""
+    plan = db.query(DcaPlan).filter(DcaPlan.id == plan_id).first()
+    if not plan:
+        raise HTTPException(404, "定投计划不存在")
+
+    from datetime import datetime as dt, timedelta
+
+    start = dt.strptime(start_date or plan.next_date, "%Y-%m-%d")
+    end = dt.now()
+    if start >= end:
+        return {"ok": True, "count": 0, "msg": "无需补投"}
+
+    # Generate trading dates based on frequency
+    dates = []
+    cur = start
+    while cur <= end:
+        if plan.frequency == "daily":
+            cur += timedelta(days=1)
+        elif plan.frequency == "weekly":
+            cur += timedelta(days=7)
+        elif plan.frequency == "biweekly":
+            cur += timedelta(days=14)
+        else:  # monthly
+            m = cur.month + 1
+            y = cur.year
+            if m > 12:
+                m = 1
+                y += 1
+            cur = cur.replace(year=y, month=m)
+        if cur <= end:
+            dates.append(cur.strftime("%Y-%m-%d"))
+
+    if not dates:
+        return {"ok": True, "count": 0, "msg": "无需补投"}
+
+    # Try to get prices from cache or yfinance
+    import yfinance as _yf
+    prices = {}
+    try:
+        tk = _yf.Ticker(plan.asset_name)
+        hist = tk.history(start=dates[0], end=end.strftime("%Y-%m-%d"), auto_adjust=True)
+        if not hist.empty:
+            for d in dates:
+                d_dt = pd.to_datetime(d)
+                # Find nearest price
+                idx = hist.index.get_indexer([d_dt], method='ffill')[0]
+                if idx >= 0 and idx < len(hist):
+                    prices[d] = round(float(hist["Close"].iloc[idx]), 2)
+    except Exception as e:
+        print(f"[backfill] price fetch failed: {e}")
+
+    # Create records
+    count = 0
+    for d in dates:
+        px = prices.get(d)
+        if not px or px <= 0:
+            continue
+        qty = round(plan.amount / px, 4)
+        notes_parts = [f"定投补投: {plan.asset_name} ({plan.frequency})"]
+        db.add(InvestmentRecord(
+            date=d, type="buy", asset_name=plan.asset_name,
+            asset_type=plan.asset_type, quantity=qty, price=px,
+            fees=plan.fees or 0, total_amount=plan.amount,
+            currency=plan.currency, platform=plan.platform,
+            account_id=plan.account_id,
+            notes=" | ".join(notes_parts),
+        ))
+        count += 1
+    db.commit()
+    return {"ok": True, "count": count, "dates": len(dates), "priced": len(prices)}
+
+
 @app.delete("/api/balances/{bal_id}")
 def api_balance_delete(bal_id: int, db: Session = Depends(get_db)):
     r = db.query(MonthlyBalance).filter(MonthlyBalance.id == bal_id).first()
