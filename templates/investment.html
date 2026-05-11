@@ -359,29 +359,32 @@ async function loadDcaPlans() {
     // Compute stats: find buy records matching this plan's asset
     const buys = allRecs.filter(r => r.type === 'buy' && r.asset_name === p.asset_name && r.notes && r.notes.includes('定投'));
     const totalCost = buys.reduce((s, r) => s + r.total_amount + (r.fees || 0), 0);
+    const totalFees = buys.reduce((s, r) => s + (r.fees || 0), 0);
     const totalShares = buys.reduce((s, r) => s + (r.quantity || 0), 0);
     const avgCost = totalShares > 0 ? totalCost / totalShares : 0;
     const currSym = p.currency === 'USD' ? '$' : '¥';
-    const statusTag = p.is_active ? '<span class="badge badge-green" style="font-size:10px;">进行中</span>' : '<span class="badge badge-gray" style="font-size:10px;">已暂停</span>';
-    return `<div class="summary-card" style="padding:8px 12px;margin-bottom:4px;">
-      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
-        <div style="flex:1;min-width:0;line-height:1.5;">
-          <div style="font-size:13px;">
-            <b>${p.asset_name}</b>
-            <span class="badge ${atypeBadge(p.asset_type)}" style="font-size:9px;margin-left:6px;">${atypeLabel(p.asset_type)}</span>
-            ${statusTag}
-            <span style="color:var(--sumi-light);font-size:11px;margin-left:6px;">${freqLabels[p.frequency]||p.frequency} ${currSym}${p.amount.toLocaleString()}${p.fees ? ' 费率'+(p.fees/p.amount*100).toFixed(2)+'%' : ''} · 下次${p.next_date}</span>
+    const statusTag = p.is_active ? '<span class="badge badge-green">进行中</span>' : '<span class="badge badge-gray">已暂停</span>';
+    return `<div class="summary-card" style="padding:12px 16px;margin-bottom:8px;">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+        <div style="flex:1;min-width:0;">
+          <div style="font-size:14px;font-weight:700;margin-bottom:4px;">${p.asset_name} <span class="badge ${atypeBadge(p.asset_type)}" style="margin-left:4px;">${atypeLabel(p.asset_type)}</span> ${statusTag}</div>
+          <div style="font-size:12px;color:var(--sumi-light);margin-bottom:6px;">
+            ${freqLabels[p.frequency]||p.frequency} · ${currSym}${p.amount.toLocaleString()}${p.fees ? ' · 费率'+(p.fees/p.amount*100).toFixed(2)+'%' : ''} · 下次 ${p.next_date}
           </div>
-          <div style="font-size:11px;color:var(--sumi-light);margin-top:2px;">
-            已投<b>${buys.length}期</b> · 投入<b>${currSym}${totalCost.toLocaleString()}</b> · 份额<b>${totalShares.toFixed(2)}</b> · 均价<b>${currSym}${avgCost.toFixed(2)}</b>
+          <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:4px 20px;font-size:13px;">
+            <div><span style="color:var(--sumi-light);">已投期数</span> <b>${buys.length}</b></div>
+            <div><span style="color:var(--sumi-light);">累计投入</span> <b>${currSym}${totalCost.toLocaleString()}</b></div>
+            <div><span style="color:var(--sumi-light);">手续费</span> <b>${currSym}${totalFees.toLocaleString()}</b></div>
+            <div><span style="color:var(--sumi-light);">累计份额</span> <b>${totalShares.toFixed(4)}</b></div>
+            <div><span style="color:var(--sumi-light);">平均成本</span> <b>${currSym}${avgCost.toFixed(2)}</b></div>
           </div>
         </div>
-        <div style="display:flex;gap:2px;flex-shrink:0;">
-          <button class="btn btn-primary btn-xs" onclick="showExecuteDialog(${p.id})">投</button>
-          <button class="btn btn-xs" style="color:var(--matcha);" onclick="backfillDca(${p.id})">补</button>
-          <button class="btn btn-secondary btn-xs" onclick="editDca(${p.id})">编</button>
-          <button class="btn btn-xs" style="color:${p.is_active?'var(--kuchiba)':'var(--matcha)'};" onclick="toggleDca(${p.id},${p.is_active ? 0 : 1})">${p.is_active?'⏸':'▶'}</button>
-          <button class="btn btn-danger btn-xs" onclick="deactivateDca(${p.id})">✕</button>
+        <div style="display:flex;gap:4px;flex-shrink:0;margin-left:12px;">
+          <button class="btn btn-primary btn-xs" onclick="showExecuteDialog(${p.id})">立即定投</button>
+          <button class="btn btn-secondary btn-xs" onclick="backfillDca(${p.id})">补投</button>
+          <button class="btn btn-secondary btn-xs" onclick="editDca(${p.id})">编辑</button>
+          <button class="btn btn-xs" style="color:${p.is_active?'var(--kuchiba)':'var(--matcha)'};" onclick="toggleDca(${p.id},${p.is_active ? 0 : 1})">${p.is_active?'暂停':'恢复'}</button>
+          <button class="btn btn-danger btn-xs" onclick="deactivateDca(${p.id})">删除</button>
         </div>
       </div>
     </div>`;
