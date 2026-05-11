@@ -115,7 +115,6 @@
         <select id="dcaFreq"><option value="daily">每日</option><option value="weekly">每周</option><option value="biweekly">双周</option><option value="monthly" selected>每月</option></select></div>
       <div class="field"><label>开始日期</label><input id="dcaStartDate" type="date"></div>
       <div class="field"><label>结束日期</label><input id="dcaEndDate" type="date" placeholder="空=无限期"></div>
-      <div class="field"><label>下次执行</label><input id="dcaNext" type="date"></div>
       <div class="field"><label>平台</label><input id="dcaPlatform" placeholder="富途 / 盈透"></div>
       <div class="field"><label>投资账户</label><select id="dcaAccount"><option value="">—</option></select></div>
       <div class="field"><label>扣款账户</label><select id="dcaPayAccount"><option value="">—</option></select></div>
@@ -476,7 +475,6 @@ function showDcaForm() {
   document.getElementById('dcaStartDate').value=''; document.getElementById('dcaEndDate').value='';
   document.getElementById('dcaPlatform').value=''; document.getElementById('dcaAccount').value='';
   document.getElementById('dcaPayAccount').value='';
-  document.getElementById('dcaNext').value = new Date().toISOString().slice(0,10);
   onDcaModeChange();
   document.getElementById('dcaForm').style.display = 'block';
 }
@@ -497,7 +495,6 @@ async function editDca(id) {
   document.getElementById('dcaPlatform').value = p.platform || '';
   document.getElementById('dcaAccount').value = p.account_id || '';
   document.getElementById('dcaPayAccount').value = p.payment_account || '';
-  document.getElementById('dcaNext').value = p.next_date;
   onDcaModeChange();
   document.getElementById('dcaForm').style.display = 'block';
 }
@@ -505,6 +502,7 @@ async function editDca(id) {
 async function saveDca() {
   const amount = parseFloat(document.getElementById('dcaAmount').value) || 0;
   const feeRate = parseFloat(document.getElementById('dcaFeeRate').value) || 0;
+  const startDate = document.getElementById('dcaStartDate').value || new Date().toISOString().slice(0,10);
   const body = {
     asset_name: document.getElementById('dcaAsset').value,
     asset_type: document.getElementById('dcaAssetType').value,
@@ -512,7 +510,7 @@ async function saveDca() {
     fees: Math.round(amount * feeRate / 100 * 100) / 100,
     currency: document.getElementById('dcaCurr').value || 'USD',
     frequency: document.getElementById('dcaFreq').value,
-    next_date: document.getElementById('dcaNext').value,
+    next_date: startDate,
     platform: document.getElementById('dcaPlatform').value,
     account_id: document.getElementById('dcaAccount').value ? parseInt(document.getElementById('dcaAccount').value) : null,
     payment_account: document.getElementById('dcaPayAccount').value ? parseInt(document.getElementById('dcaPayAccount').value) : null,
@@ -521,10 +519,25 @@ async function saveDca() {
   const editId = document.getElementById('dcaEditId').value;
   const url = editId ? `/api/dca-plans/${editId}` : '/api/dca-plans';
   const method = editId ? 'PUT' : 'POST';
-  await fetch(url, { method, headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) });
+  const r = await fetch(url, { method, headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) });
+  const saved = await r.json();
   document.getElementById('dcaForm').style.display = 'none';
+
+  // Auto backfill if start date is in the past
+  const startDate = document.getElementById('dcaStartDate').value;
+  if (startDate && startDate < new Date().toISOString().slice(0,10)) {
+    const bf = await fetch(`/api/dca-plans/${saved.id}/backfill?start_date=${startDate}`, { method: 'POST' });
+    const bfResult = await bf.json();
+    if (bfResult.ok && bfResult.count > 0) {
+      toast(`定投已创建，自动补投 ${bfResult.count} 期`, 'ok');
+      loadInvestments();
+    } else {
+      toast(editId ? '定投已更新' : '定投计划已创建', 'ok');
+    }
+  } else {
+    toast(editId ? '定投已更新' : '定投计划已创建', 'ok');
+  }
   loadDcaPlans();
-  toast(editId ? '定投已更新' : '定投计划已创建', 'ok');
 }
 
 // Execute DCA with price choice
