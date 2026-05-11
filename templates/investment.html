@@ -150,6 +150,21 @@ function atypeLabel(t) { return atypeLabels[t] || t; }
 function atypeBadge(t) { return atypeColors[t] || 'badge-gray'; }
 let investAccounts = [], allAccounts = [];
 
+async function autoFillName(inputEl) {
+  const code = inputEl.value.trim().toUpperCase();
+  if (!code || code.length < 2) return;
+  try {
+    // Check portfolio cache for name
+    const r = await fetch('/api/portfolio');
+    const d = await r.json();
+    const h = (d.holdings || []).find(h => h.asset_name.toUpperCase() === code);
+    if (h && h.display_name && h.display_name !== code) {
+      inputEl.placeholder = h.display_name;
+      return;
+    }
+  } catch(e) {}
+}
+
 async function init() {
   document.getElementById('invDate').value = new Date().toISOString().slice(0,10);
   document.getElementById('dcaNext').value = new Date().toISOString().slice(0,10);
@@ -167,6 +182,10 @@ async function init() {
   document.getElementById('invQty').addEventListener('input', calcTotal);
   document.getElementById('invPrice').addEventListener('input', calcTotal);
   document.getElementById('invFees').addEventListener('input', calcTotal);
+
+  // Auto-fill asset name on blur
+  document.getElementById('invAsset').addEventListener('blur', function() { autoFillName(this); });
+  document.getElementById('dcaAsset').addEventListener('blur', function() { autoFillName(this); });
 
   await startAutoRefresh();
   await loadBalances();
@@ -356,21 +375,60 @@ async function loadDcaPlans() {
     document.getElementById('dcaList').innerHTML = '<div style="color:var(--sumi-light);font-size:13px;">暂无定投计划</div>';
     return;
   }
-  const freqLabels = { weekly: '每周', biweekly: '双周', monthly: '每月' };
-  document.getElementById('dcaList').innerHTML = `<table style="table-layout:fixed;">
-    <thead><tr><th>标的</th><th>金额</th><th>频率</th><th>下次执行</th><th>状态</th><th>操作</th></tr></thead>
-    <tbody>${allDcaPlans.map(p => `<tr>
-      <td style="font-weight:500;">${p.asset_name}</td>
-      <td class="num-col">${p.amount.toLocaleString()} ${p.currency}${p.fees ? ' + '+p.fees : ''}</td>
-      <td>${freqLabels[p.frequency] || p.frequency}</td>
-      <td>${p.next_date}</td>
-      <td>${p.is_active ? '<span class="badge badge-green">生效</span>' : '<span class="badge badge-gray">停用</span>'}</td>
-      <td>
-        <button class="btn btn-primary btn-xs" onclick="showExecuteDialog(${p.id})">执行</button>
-        <button class="btn btn-secondary btn-xs" onclick="editDca(${p.id})">编辑</button>
-        <button class="btn btn-danger btn-xs" onclick="deactivateDca(${p.id})">停用</button>
-      </td>
-    </tr>`).join('')}</tbody></table>`;
+  // Fetch related investment records for stats
+  const ir = await fetch('/api/investments'); const allRecs = await ir.json();
+  const freqLabels = { daily:'每日', weekly:'每周', biweekly:'双周', monthly:'每月' };
+  document.getElementById('dcaList').innerHTML = allDcaPlans.map(p => {
+    // Compute stats: find buy records matching this plan's asset
+    const buys = allRecs.filter(r => r.type === 'buy' && r.asset_name === p.asset_name && r.notes && r.notes.includes('定投'));
+    const totalCost = buys.reduce((s, r) => s + r.total_amount + (r.fees || 0), 0);
+    const totalShares = buys.reduce((s, r) => s + (r.quantity || 0), 0);
+    const avgCost = totalShares > 0 ? totalCost / totalShares : 0;
+    const curPx = 0; // will be filled by portfolio
+    const curVal = 0; // will be filled by portfolio
+    const ret = totalCost > 0 && curVal > 0 ? ((curVal - totalCost) / totalCost * 100) : null;
+    const statusBadge = p.is_active ? '<span class="badge badge-green">进行中</span>' : '<span class="badge badge-gray">已暂停</span>';
+    const pauseLabel = p.is_active ? '暂停' : '恢复';
+    const pauseColor = p.is_active ? 'btn-xs' : 'btn-xs';
+    return `<div class="summary-card" style="padding:14px 18px;margin-bottom:8px;">
+      <div style="display:flex;justify-content:space-between;align-items:start;">
+        <div style="flex:1;">
+          <div style="font-weight:600;font-size:15px;">${p.asset_name}</div>
+          <div style="font-size:12px;color:var(--sumi-light);margin-top:2px;">
+            <span class="badge ${atypeBadge(p.asset_type)}">${atypeLabel(p.asset_type)}</span>
+            ${p.frequency ? ' · '+freqLabels[p.frequency] : ''} · 每期 ${p.currency==='USD'?'$':'¥'}${p.amount.toLocaleString()}${p.fees ? ' (费率'+(p.fees/p.amount*100).toFixed(2)+'%)' : ''}
+          </div>
+          <div style="display:flex;gap:24px;margin-top:10px;font-size:13px;">
+            <div><span style="color:var(--sumi-light);">已投</span> <b>${buys.length}期</b></div>
+            <div><span style="color:var(--sumi-light);">累计投入</span> <b>${p.currency==='USD'?'$':'¥'}${totalCost.toLocaleString()}</b></div>
+            <div><span style="color:var(--sumi-light);">累计份额</span> <b>${totalShares.toFixed(2)}</b></div>
+            <div><span style="color:var(--sumi-light);">均价</span> <b>${p.currency==='USD'?'$':'¥'}${avgCost.toFixed(2)}</b></div>
+            ${ret != null ? `<div><span style="color:var(--sumi-light);">收益率</span> <b class="${ret>=0?'diff-positive':'diff-negative'}">${ret>=0?'+':''}${ret.toFixed(2)}%</b></div>` : ''}
+          </div>
+        </div>
+        <div style="text-align:right;white-space:nowrap;">
+          <div style="font-size:12px;color:var(--sumi-light);">下次: ${p.next_date}</div>
+          <div style="margin:4px 0;">${statusBadge}</div>
+          <div style="display:flex;gap:4px;justify-content:flex-end;margin-top:8px;">
+            <button class="btn btn-primary btn-xs" onclick="showExecuteDialog(${p.id})">立即定投</button>
+            <button class="btn btn-secondary btn-xs" onclick="editDca(${p.id})">编辑</button>
+            <button class="btn ${p.is_active ? 'btn-xs' : 'btn-xs'}" style="color:${p.is_active?'var(--kuchiba)':'var(--matcha)'};" onclick="toggleDca(${p.id},${p.is_active ? 0 : 1})">${pauseLabel}</button>
+            <button class="btn btn-danger btn-xs" onclick="deactivateDca(${p.id})">删除</button>
+          </div>
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+async function toggleDca(id, active) {
+  await fetch(`/api/dca-plans/${id}`, {
+    method: 'PUT',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ is_active: active })
+  });
+  loadDcaPlans();
+  toast(active ? '已恢复' : '已暂停', 'ok');
 }
 
 function showDcaForm() {
