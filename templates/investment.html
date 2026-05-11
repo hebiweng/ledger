@@ -912,7 +912,7 @@ init();
         <select id="dcaHoliday"><option value="skip">跳过本期</option><option value="next">顺延至下一交易日</option><option value="prev">提前至上一交易日</option></select></div>
       <div class="field"><label>开始日期</label><input id="dcaStartDate" type="date"></div>
       <div class="field"><label>结束日期</label>
-        <div style="display:flex;gap:4px;align-items:center;"><input id="dcaEndDate" type="date" placeholder="空=无限期"> <label style="font-size:12px;white-space:nowrap;"><input type="checkbox" id="dcaEndInfinite" checked onchange="document.getElementById('dcaEndDate').disabled=this.checked"> 无限期</label></div></div>
+        <div style="display:flex;gap:4px;align-items:center;"><input id="dcaEndDate" type="date" placeholder="空=无限期"> <label style="font-size:12px;white-space:nowrap;"><input type="checkbox" id="dcaEndInfinite" checked onchange="document.getElementById('dcaEndDate').disabled=this.checked" style="width:14px;height:14px;margin:0;"> 无限期</label></div></div>
       <div class="field"><label>下次执行</label><input id="dcaNextDisplay" type="text" readonly style="background:var(--washi);"></div>
       <div class="field"><label>平台</label><input id="dcaPlatform" placeholder="富途 / 盈透"></div>
       <div class="field"><label>投资账户</label><select id="dcaAccount"><option value="">—</option></select></div>
