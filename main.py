@@ -2409,12 +2409,6 @@ def api_backup_export(data: dict, db: Session = Depends(get_db)):
                     headers={"Content-Disposition": "attachment; filename=ledger_backup.enc"})
 
 
-@app.post("/api/backup/import")
-def api_backup_import(request: dict, db: Session = Depends(get_db)):
-    """Import data from an encrypted backup. Merges: updates existing, inserts new."""
-    from fastapi import UploadFile, File, Form
-    raise HTTPException(400, "Use multipart form: password + file")
-
 
 @app.post("/api/backup/import/file")
 async def api_backup_import_file(password: str = Form(...), file: UploadFile = File(...), db: Session = Depends(get_db)):

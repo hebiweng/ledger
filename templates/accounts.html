@@ -216,9 +216,9 @@ loadAccounts();
     <button class="btn btn-primary btn-sm" onclick="exportData()">📥 导出备份</button>
     <label class="btn btn-secondary btn-sm" style="cursor:pointer;">
       📤 导入备份
-      <input type="file" id="importFile" accept=".json" onchange="importData(this)" style="display:none;">
+      <input type="file" id="importFile" accept=".enc" onchange="importData(this)" style="display:none;">
     </label>
-    <span style="font-size:11px;color:var(--sumi-light);">支持全量备份还原，格式 JSON</span>
+    <span style="font-size:11px;color:var(--sumi-light);">支持全量备份还原，格式 ENC（加密）</span>
   </div>
 </div>
 
