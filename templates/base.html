@@ -21,6 +21,8 @@
     <a href="/backtest" class="{{ 'active' if nav == 'backtest' else '' }}">回测</a>
     <a href="/dashboard" class="{{ 'active' if nav == 'dashboard' else '' }}">总览</a>
     <a href="/accounts" class="{{ 'active' if nav == 'accounts' else '' }}">账户管理</a>
+    <span style="flex:1;"></span>
+    <button class="btn btn-primary btn-sm" onclick="refreshAllPrices()" id="refreshBtn" style="font-size:11px;">🔄 刷新行情</button>
   </nav>
   <div id="toast" class="toast" style="display:none;"></div>
   <div class="container">
@@ -45,6 +47,27 @@
   </div>
 
   <script>
+  async function refreshAllPrices() {
+    var btn = document.getElementById('refreshBtn');
+    btn.textContent = '⏳ 刷新中...'; btn.disabled = true;
+    try {
+      await fetch('/api/portfolio?refresh=true');
+      // Also refresh DCA assets
+      try {
+        var r = await fetch('/api/dca-plans');
+        var plans = await r.json();
+        var tickers = [...new Set(plans.map(function(p){return p.asset_name;}))];
+        if (tickers.length > 0) {
+          await fetch('/api/refresh-dca-prices?tickers=' + tickers.join(','));
+        }
+      } catch(e) {}
+      toast('行情已刷新', 'ok');
+      location.reload();
+    } catch(e) {
+      toast('刷新失败', 'err');
+      btn.textContent = '🔄 刷新行情'; btn.disabled = false;
+    }
+  }
   function toast(msg, type) {
     const el = document.getElementById('toast');
     const colors = { ok: '#3B7D4A', err: '#C04540', warn: '#C2783A', info: '#3B5CCC' };

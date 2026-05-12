@@ -1,9 +1,11 @@
 """Personal ledger web app — FastAPI entry point."""
 import json
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime
 
 from fastapi import FastAPI, Depends, HTTPException, Form, UploadFile, File
+from pydantic import BaseModel
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from jinja2 import Environment, FileSystemLoader
@@ -14,7 +16,8 @@ from models import (
     Base, PRESET_CATEGORIES,
     Account, MonthlyBalance, IncomeRecord,
     ExpenseRecord, ExpenseCategory, RecurringExpense,
-    InvestmentRecord, ExchangeRate, DcaPlan
+    InvestmentRecord, ExchangeRate, DcaPlan, MarketPrice,
+    PerformanceSnapshot, TradingCalendar,
 )
 from schemas import (
     AccountCreate, AccountUpdate,
@@ -27,11 +30,6 @@ from schemas import (
 )
 from exchange_rate import get_rate, convert_to_cny, refresh_all_rates
 from recurring import ensure_expenses_for_month
-
-app = FastAPI(title="个人账本")
-
-app.mount("/static", StaticFiles(directory="static"), name="static")
-jinja_env = Environment(loader=FileSystemLoader("templates"), autoescape=True)
 
 
 def _now():
@@ -46,8 +44,8 @@ def seed_categories(db: Session):
         db.commit()
 
 
-@app.on_event("startup")
-def on_startup():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     init_db()
     db = next(get_db())
     try:
@@ -55,6 +53,13 @@ def on_startup():
         refresh_all_rates(db)
     finally:
         db.close()
+    yield
+
+
+app = FastAPI(title="个人账本", lifespan=lifespan)
+
+app.mount("/static", StaticFiles(directory="static"), name="static")
+jinja_env = Environment(loader=FileSystemLoader("templates"), autoescape=True)
 
 
 # ── Page routes ──────────────────────────────────────────────
@@ -91,7 +96,17 @@ def page_investment3(db: Session = Depends(get_db)):
     investments_data = [{"id": r.id, "date": r.date, "type": r.type, "asset_name": r.asset_name, "asset_type": r.asset_type, "quantity": r.quantity, "price": r.price, "fees": r.fees, "total_amount": r.total_amount, "currency": r.currency, "platform": r.platform or "", "account_id": r.account_id, "notes": r.notes or ""} for r in inv_rows]
     # DCA
     dca_rows = db.query(DcaPlan).order_by(DcaPlan.is_active.desc(), DcaPlan.next_date).all()
-    dca_data = [{"id": r.id, "asset_name": r.asset_name, "asset_type": r.asset_type, "amount": r.amount, "fees": r.fees or 0, "currency": r.currency, "frequency": r.frequency, "next_date": r.next_date, "is_active": r.is_active} for r in dca_rows]
+    dca_data = [{"id": r.id, "asset_name": r.asset_name, "asset_type": r.asset_type, "amount": r.amount, "fees": r.fees or 0, "currency": r.currency, "frequency": r.frequency, "start_date": r.start_date, "next_date": r.next_date, "is_active": r.is_active} for r in dca_rows]
+    # Add names from market_prices cache for DCA assets
+    dca_names = {}
+    for d in dca_data:
+        mp = db.query(MarketPrice).filter(MarketPrice.ticker == d["asset_name"]).order_by(MarketPrice.date.desc()).first()
+        if mp and mp.name and mp.name != d["asset_name"]:
+            dca_names[d["asset_name"]] = mp.name
+    if dca_names:
+        for d in dca_data:
+            if d["asset_name"] in dca_names:
+                d["display_name"] = dca_names[d["asset_name"]]
     # Balances
     month_bals = db.query(MonthlyBalance).filter(MonthlyBalance.year == now.year, MonthlyBalance.month == now.month).all()
     bal_map = {}
@@ -111,12 +126,65 @@ def page_investment3(db: Session = Depends(get_db)):
             holdings[key]["total_cost"] -= r.total_amount - (r.fees or 0)
     portfolio_holdings = []
     total_cost_cny = 0.0
+    total_fees_raw = 0.0
     for h in holdings.values():
         if h["quantity"] <= 0: continue
         avg = h["total_cost"] / h["quantity"]
         total_cost_cny += h["total_cost"]
+        total_fees_raw += h["total_fees"]
         portfolio_holdings.append({"asset_name": h["asset_name"], "asset_type": h["asset_type"], "currency": h["currency"], "quantity": round(h["quantity"], 4), "total_cost": round(h["total_cost"], 2), "avg_cost": round(avg, 2), "total_fees": round(h["total_fees"], 2)})
-    embedded = _json.dumps({"accounts": accounts_data, "investments": investments_data, "dca": dca_data, "balances": bal_map, "portfolio": {"holdings": portfolio_holdings, "total_cost_cny": round(total_cost_cny, 2)}, "today": now.strftime("%Y-%m-%d")}, ensure_ascii=False)
+
+    price_cache = _load_portfolio_cache(db)
+    total_value = 0.0
+    has_prices = False
+    for h in portfolio_holdings:
+        cached = price_cache.get(h["asset_name"])
+        if cached and "price" in cached:
+            px = cached["price"]
+            h["current_price"] = px
+            h["current_value"] = round(h["quantity"] * px, 2)
+            h["profit"] = round(h["current_value"] - h["total_cost"], 2)
+            h["profit_pct"] = round(h["profit"] / h["total_cost"] * 100, 2) if h["total_cost"] > 0 else 0
+            h["change_pct"] = cached.get("change_pct")
+            h["display_name"] = cached.get("name")
+            total_value += h["current_value"]
+            has_prices = True
+
+    # Latest cache date
+    cache_date = None
+    for h in portfolio_holdings:
+        if h.get("current_price") is not None:
+            cached = price_cache.get(h["asset_name"])
+            if cached and cached.get("date"):
+                if cache_date is None or cached["date"] > cache_date:
+                    cache_date = cached["date"]
+
+    summary = {
+        "total_cost_cny": round(total_cost_cny, 2),
+        "holdings_count": len(portfolio_holdings),
+        "total_fees_cny": round(total_fees_raw, 2),
+        "cache_date": cache_date,
+    }
+    if has_prices:
+        summary["total_value_cny"] = round(total_value, 2)
+        summary["total_profit_cny"] = round(total_value - total_cost_cny, 2)
+        summary["total_profit_pct"] = round((total_value - total_cost_cny) / total_cost_cny * 100, 2) if total_cost_cny > 0 else 0
+    else:
+        summary["total_value_cny"] = None
+        summary["total_profit_cny"] = None
+        summary["total_profit_pct"] = None
+        summary["daily_change_pct"] = None
+
+    embedded = _json.dumps({
+        "accounts": accounts_data, "investments": investments_data,
+        "dca": dca_data, "balances": bal_map,
+        "portfolio": {
+            "holdings": portfolio_holdings,
+            "total_cost_cny": round(total_cost_cny, 2),
+            "summary": summary,
+        },
+        "today": now.strftime("%Y-%m-%d"),
+    }, ensure_ascii=False)
     tpl = jinja_env.get_template("investment3.html")
     return HTMLResponse(tpl.render(nav="investment3", preload=embedded))
 
@@ -272,7 +340,18 @@ def api_accounts(db: Session = Depends(get_db)):
 def api_account_create(data: AccountCreate, db: Session = Depends(get_db)):
     currencies = data.currencies if data.currencies else [data.currency]
 
-    if len(currencies) == 1:
+    # Adding a sub-account to an existing multi-currency parent
+    if data.parent_id:
+        parent = db.query(Account).filter(Account.id == data.parent_id).first()
+        if parent:
+            sub = Account(name=parent.name, type=parent.type, currency=data.currency,
+                          parent_id=parent.id, is_active=1, sort_order=parent.sort_order, notes=parent.notes or "")
+            db.add(sub)
+            db.commit()
+            db.refresh(sub)
+            return {"id": sub.id, "name": sub.name, "currency": sub.currency, "parent_id": parent.id}
+
+    if len(currencies) == 1 and not data.parent_id:
         a = Account(name=data.name, type=data.type, currency=currencies[0],
                     is_active=data.is_active, sort_order=data.sort_order, notes=data.notes)
         db.add(a)
@@ -293,6 +372,58 @@ def api_account_create(data: AccountCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(parent)
     return {"id": parent.id, "name": parent.name, "currency": "MULTI", "currencies": currencies}
+
+
+class AddCurrencyRequest(BaseModel):
+    currency: str
+
+@app.post("/api/accounts/{acc_id}/add-currency")
+def api_account_add_currency(acc_id: int, data: AddCurrencyRequest, db: Session = Depends(get_db)):
+    """Add a new currency to an account. Converts single-currency to multi if needed."""
+    currency = data.currency.strip().upper()
+    if not currency or len(currency) > 10:
+        raise HTTPException(400, "无效币种")
+
+    account = db.query(Account).filter(Account.id == acc_id).first()
+    if not account:
+        raise HTTPException(404, "账户不存在")
+
+    # If this account is a sub-account, operate on its parent
+    if account.parent_id:
+        acc_id = account.parent_id
+        account = db.query(Account).filter(Account.id == acc_id).first()
+
+    if account.currency != "MULTI":
+        # Convert single-currency to multi-currency
+        parent = Account(
+            name=account.name, type=account.type, currency="MULTI",
+            is_active=account.is_active, sort_order=account.sort_order,
+            notes=account.notes or ""
+        )
+        db.add(parent)
+        db.flush()
+        # Move existing account as first sub
+        account.parent_id = parent.id
+        account.updated_at = _now()
+        # Add new currency as second sub
+        sub = Account(
+            name=account.name, type=account.type, currency=currency,
+            parent_id=parent.id, is_active=1, sort_order=account.sort_order,
+            notes=account.notes or ""
+        )
+        db.add(sub)
+        db.commit()
+        return {"ok": True, "converted": True, "currency": currency, "parent_id": parent.id}
+    else:
+        # Already multi-currency: add new sub
+        sub = Account(
+            name=account.name, type=account.type, currency=currency,
+            parent_id=account.id, is_active=1, sort_order=account.sort_order,
+            notes=account.notes or ""
+        )
+        db.add(sub)
+        db.commit()
+        return {"ok": True, "converted": False, "currency": currency}
 
 
 @app.put("/api/accounts/{acc_id}")
@@ -771,7 +902,8 @@ def api_dca_plans(db: Session = Depends(get_db)):
         "amount": r.amount, "fees": r.fees, "currency": r.currency,
         "platform": r.platform, "account_id": r.account_id,
         "payment_account": r.payment_account, "frequency": r.frequency,
-        "next_date": r.next_date, "is_active": r.is_active, "notes": r.notes,
+        "start_date": r.start_date, "next_date": r.next_date,
+        "is_active": r.is_active, "notes": r.notes,
     } for r in rows]
 
 
@@ -782,8 +914,8 @@ def api_dca_create(data: dict, db: Session = Depends(get_db)):
         amount=data["amount"], fees=data.get("fees", 0),
         currency=data.get("currency", "CNY"), platform=data.get("platform", ""),
         account_id=data.get("account_id"), payment_account=data.get("payment_account"),
-        frequency=data.get("frequency", "monthly"), next_date=data["next_date"],
-        notes=data.get("notes", ""),
+        frequency=data.get("frequency", "monthly"), start_date=data.get("start_date"),
+        next_date=data["next_date"], notes=data.get("notes", ""),
     )
     db.add(plan)
     db.commit()
@@ -810,6 +942,11 @@ def api_dca_delete(plan_id: int, hard: bool = False, db: Session = Depends(get_d
     if not plan:
         raise HTTPException(404, "定投计划不存在")
     if hard:
+        # Also delete associated investment records
+        db.query(InvestmentRecord).filter(
+            InvestmentRecord.asset_name == plan.asset_name,
+            InvestmentRecord.notes.like("%定投%")
+        ).delete()
         db.delete(plan)
     else:
         plan.is_active = 0
@@ -822,24 +959,23 @@ def api_dca_delete(plan_id: int, hard: bool = False, db: Session = Depends(get_d
 def api_dca_execute(plan_id: int, price: float | None = None, note: str | None = None, db: Session = Depends(get_db)):
     """Manually execute a DCA plan — creates an investment record.
 
-    price: if None, try to fetch current market price; if 0 or provided, use it.
-    note: optional extra notes (e.g. balance warning).
-    quantity = plan.amount / price  (fees don't buy shares)
+    price: if None, try to fetch current market price.
+    Fees are deducted from the amount: invest_amount = amount - fees.
     """
     plan = db.query(DcaPlan).filter(DcaPlan.id == plan_id).first()
     if not plan:
         raise HTTPException(404, "定投计划不存在")
 
-    # Check payment account balance
+    # Check investment account balance
     balance_ok = True
-    if plan.payment_account:
+    if plan.account_id:
         now_dt = datetime.now()
-        pmt_bal = db.query(MonthlyBalance).filter(
-            MonthlyBalance.account_id == plan.payment_account,
+        acct_bal = db.query(MonthlyBalance).filter(
+            MonthlyBalance.account_id == plan.account_id,
             MonthlyBalance.year == now_dt.year,
             MonthlyBalance.month == now_dt.month,
         ).first()
-        if pmt_bal and pmt_bal.balance < plan.amount:
+        if acct_bal and acct_bal.balance < plan.amount:
             balance_ok = False
 
     resolved_price = price
@@ -848,7 +984,9 @@ def api_dca_execute(plan_id: int, price: float | None = None, note: str | None =
         if p:
             resolved_price = p
 
-    qty = round(plan.amount / resolved_price, 4) if resolved_price else None
+    fee = plan.fees or 0
+    invest_amount = plan.amount - fee  # fees deducted from amount
+    qty = round(invest_amount / resolved_price, 4) if resolved_price and invest_amount > 0 else None
 
     notes_parts = [f"定投: {plan.asset_name} ({plan.frequency})"]
     if not balance_ok:
@@ -863,28 +1001,39 @@ def api_dca_execute(plan_id: int, price: float | None = None, note: str | None =
         asset_type=plan.asset_type,
         quantity=qty,
         price=resolved_price,
-        fees=plan.fees or 0,
-        total_amount=plan.amount,
+        fees=fee,
+        total_amount=invest_amount,
         currency=plan.currency,
         platform=plan.platform,
         account_id=plan.account_id,
         notes=" | ".join(notes_parts),
     )
     db.add(inv)
+    # Save price to market_prices for DCA display
+    if resolved_price:
+        existing_mp = db.query(MarketPrice).filter(
+            MarketPrice.ticker == plan.asset_name, MarketPrice.date == plan.next_date
+        ).first()
+        if existing_mp:
+            existing_mp.close_price = resolved_price
+            existing_mp.source = "dca"
+            existing_mp.updated_at = _now()
+        else:
+            db.add(MarketPrice(ticker=plan.asset_name, date=plan.next_date,
+                               close_price=resolved_price, source="dca", updated_at=_now()))
     # Advance next_date
     from datetime import datetime as dt, timedelta
     nd = dt.strptime(plan.next_date, "%Y-%m-%d")
-    if plan.frequency == "weekly":
+    if plan.frequency == "daily":
+        nd += timedelta(days=1)
+    elif plan.frequency == "weekly":
         nd += timedelta(days=7)
     elif plan.frequency == "biweekly":
         nd += timedelta(days=14)
     else:
-        # monthly: advance one month
         m = nd.month + 1
         y = nd.year
-        if m > 12:
-            m = 1
-            y += 1
+        if m > 12: m = 1; y += 1
         nd = nd.replace(year=y, month=m)
     plan.next_date = nd.strftime("%Y-%m-%d")
     plan.updated_at = _now()
@@ -893,7 +1042,125 @@ def api_dca_execute(plan_id: int, price: float | None = None, note: str | None =
 
 
 @app.post("/api/dca-plans/{plan_id}/backfill")
-def api_dca_backfill(plan_id: int, start_date: str = None, db: Session = Depends(get_db)):
+def _resolve_market(asset_type: str) -> str:
+    """Map asset type to market for trading calendar."""
+    if asset_type == "fund": return "CN"
+    return "US"  # default for stock/etf/crypto
+
+
+def _is_trading_day(date_str: str, market: str, db: Session) -> bool:
+    """Check if date is a trading day. Caches result in DB."""
+    existing = db.query(TradingCalendar).filter(
+        TradingCalendar.date == date_str, TradingCalendar.market == market
+    ).first()
+    if existing is not None:
+        return bool(existing.is_trading)
+
+    # Check via akshare
+    try:
+        import akshare as ak
+        if market == "US":
+            df = ak.tool_trade_date_hist_sina()
+            if df is not None and not df.empty:
+                trade_dates = set(df['trade_date'].tolist())
+            else:
+                # Fallback: assume Mon-Fri are trading days
+                from datetime import datetime as _dt
+                d = _dt.strptime(date_str, "%Y-%m-%d")
+                trade_dates = set() if d.weekday() >= 5 else {date_str}
+        else:  # CN
+            df = ak.tool_trade_date_hist_sina()
+            if df is not None and not df.empty:
+                trade_dates = set(df['trade_date'].tolist())
+            else:
+                from datetime import datetime as _dt
+                d = _dt.strptime(date_str, "%Y-%m-%d")
+                trade_dates = set() if d.weekday() >= 5 else {date_str}
+    except Exception:
+        # If akshare fails, assume Mon-Fri are trading days
+        from datetime import datetime as _dt
+        d = _dt.strptime(date_str, "%Y-%m-%d")
+        is_trade = d.weekday() < 5
+        db.add(TradingCalendar(date=date_str, market=market, is_trading=1 if is_trade else 0))
+        db.commit()
+        return is_trade
+
+    is_trade = 1 if date_str in trade_dates else 0
+    db.add(TradingCalendar(date=date_str, market=market, is_trading=is_trade))
+    db.commit()
+    return bool(is_trade)
+
+
+@app.post("/api/market-prices")
+def api_market_prices_create(data: dict, db: Session = Depends(get_db)):
+    """Save a manual price entry to market_prices table."""
+    ticker = data.get("ticker")
+    date_val = data.get("date")
+    close = data.get("close_price")
+    if not ticker or not date_val or close is None:
+        raise HTTPException(400, "缺少字段")
+    existing = db.query(MarketPrice).filter(
+        MarketPrice.ticker == ticker, MarketPrice.date == date_val
+    ).first()
+    if existing:
+        existing.close_price = close
+        existing.source = data.get("source", "manual")
+        existing.updated_at = _now()
+    else:
+        db.add(MarketPrice(ticker=ticker, date=date_val, close_price=close,
+                           source=data.get("source", "manual"), updated_at=_now()))
+    db.commit()
+    return {"ok": True}
+
+
+@app.get("/api/refresh-dca-prices")
+def api_refresh_dca_prices(tickers: str = "", db: Session = Depends(get_db)):
+    """Refresh prices for DCA assets even if they have no holdings."""
+    from datetime import date as dt_date
+    today = dt_date.today().isoformat()
+    results = {}
+    for symbol in tickers.split(","):
+        symbol = symbol.strip()
+        if not symbol: continue
+        try:
+            plan = db.query(DcaPlan).filter(DcaPlan.asset_name == symbol).first()
+            asset_type = plan.asset_type if plan else "stock"
+            px, _, name, chg = _fetch_price(symbol, "USD", db, asset_type)
+            if px is not None:
+                existing = db.query(MarketPrice).filter(
+                    MarketPrice.ticker == symbol, MarketPrice.date == today
+                ).first()
+                if existing:
+                    existing.close_price = px
+                    existing.change_pct = chg
+                    existing.name = name
+                    existing.source = "dca-refresh"
+                    existing.updated_at = _now()
+                else:
+                    db.add(MarketPrice(ticker=symbol, date=today, close_price=px,
+                                       change_pct=chg, name=name, source="dca-refresh", updated_at=_now()))
+                db.commit()
+                results[symbol] = {"price": px, "name": name, "ok": True}
+            else:
+                results[symbol] = {"price": None, "name": None, "ok": False, "error": "no data"}
+        except Exception as e:
+            results[symbol] = {"price": None, "name": None, "ok": False, "error": str(e)}
+    return {"ok": True, "results": results}
+
+
+@app.get("/api/market-status")
+def api_market_status():
+    """Return market status. after_close = true only when market has closed for the day."""
+    from datetime import timezone, timedelta
+    now_utc = datetime.now(timezone.utc)
+    et = now_utc + timedelta(hours=-4)  # EDT
+    # After 4:00 PM ET = market closed for the day
+    market_close = et.replace(hour=16, minute=0, second=0, microsecond=0)
+    after_close = et >= market_close and et.weekday() < 5
+    return {"open": _is_market_open(), "closed": after_close}
+
+
+def api_dca_backfill(plan_id: int, start_date: str = None, holiday: str = "skip", db: Session = Depends(get_db)):
     """Generate historical buy records for a DCA plan from start_date to today."""
     plan = db.query(DcaPlan).filter(DcaPlan.id == plan_id).first()
     if not plan:
@@ -902,7 +1169,11 @@ def api_dca_backfill(plan_id: int, start_date: str = None, db: Session = Depends
     from datetime import datetime as dt, timedelta
 
     start = dt.strptime(start_date or plan.next_date, "%Y-%m-%d")
+    market = _resolve_market(plan.asset_type)
     end = dt.now()
+    # Don't backfill today if market hasn't closed yet
+    if not _is_market_open():
+        end = end - timedelta(days=1)
     if start >= end:
         return {"ok": True, "count": 0, "msg": "无需补投"}
 
@@ -924,39 +1195,80 @@ def api_dca_backfill(plan_id: int, start_date: str = None, db: Session = Depends
                 y += 1
             cur = cur.replace(year=y, month=m)
         if cur <= end:
-            dates.append(cur.strftime("%Y-%m-%d"))
+            date_str = cur.strftime("%Y-%m-%d")
+            if not _is_trading_day(date_str, market, db):
+                if holiday == "skip":
+                    continue  # skip this period entirely
+                elif holiday == "next":
+                    # Advance to next trading day
+                    nxt = cur
+                    for _ in range(10):
+                        nxt += timedelta(days=1)
+                        if _is_trading_day(nxt.strftime("%Y-%m-%d"), market, db):
+                            date_str = nxt.strftime("%Y-%m-%d")
+                            break
+                        if nxt > end:
+                            continue
+            dates.append(date_str)
 
     if not dates:
         return {"ok": True, "count": 0, "msg": "无需补投"}
 
-    # Try to get prices from cache or yfinance
-    import yfinance as _yf
+    # Get prices: try DB cache first, then akshare
     prices = {}
-    try:
-        tk = _yf.Ticker(plan.asset_name)
-        hist = tk.history(start=dates[0], end=end.strftime("%Y-%m-%d"), auto_adjust=True)
-        if not hist.empty:
-            for d in dates:
-                d_dt = pd.to_datetime(d)
-                # Find nearest price
-                idx = hist.index.get_indexer([d_dt], method='ffill')[0]
-                if idx >= 0 and idx < len(hist):
-                    prices[d] = round(float(hist["Close"].iloc[idx]), 2)
-    except Exception as e:
-        print(f"[backfill] price fetch failed: {e}")
+    # 1. Try market_prices table
+    for d in dates:
+        mp = db.query(MarketPrice).filter(
+            MarketPrice.ticker == plan.asset_name, MarketPrice.date == d
+        ).first()
+        if mp and mp.close_price > 0:
+            prices[d] = mp.close_price
+
+    # 2. Try akshare for missing dates
+    missing = [d for d in dates if d not in prices]
+    if missing:
+        try:
+            import akshare as ak
+            df = ak.stock_us_hist(symbol=plan.asset_name, period="daily",
+                                  start_date=missing[0].replace("-",""),
+                                  end_date=missing[-1].replace("-",""))
+            if df is not None and not df.empty:
+                for d in missing:
+                    row = df[df['日期'] == d]
+                    if not row.empty:
+                        px = float(row['收盘'].iloc[0])
+                        if px > 0:
+                            prices[d] = round(px, 2)
+            print(f"[backfill] akshare: got {len([d for d in missing if d in prices])} prices for {plan.asset_name}")
+        except Exception as e:
+            print(f"[backfill] akshare failed: {e}")
+
+    # Check for existing records to avoid duplicates
+    existing_dates = set()
+    existing = db.query(InvestmentRecord).filter(
+        InvestmentRecord.asset_name == plan.asset_name,
+        InvestmentRecord.type == "buy",
+        InvestmentRecord.notes.like("%定投补投%")
+    ).all()
+    for e in existing:
+        existing_dates.add(e.date)
 
     # Create records
     count = 0
     for d in dates:
+        if d in existing_dates:
+            continue
         px = prices.get(d)
         if not px or px <= 0:
             continue
-        qty = round(plan.amount / px, 4)
+        fee = plan.fees or 0
+        invest_amount = plan.amount - fee
+        qty = round(invest_amount / px, 4) if invest_amount > 0 else 0
         notes_parts = [f"定投补投: {plan.asset_name} ({plan.frequency})"]
         db.add(InvestmentRecord(
             date=d, type="buy", asset_name=plan.asset_name,
             asset_type=plan.asset_type, quantity=qty, price=px,
-            fees=plan.fees or 0, total_amount=plan.amount,
+            fees=fee, total_amount=invest_amount,
             currency=plan.currency, platform=plan.platform,
             account_id=plan.account_id,
             notes=" | ".join(notes_parts),
@@ -1113,48 +1425,43 @@ def api_investment_delete(inv_id: int, db: Session = Depends(get_db)):
 
 # ── Portfolio API ───────────────────────────────────────
 
-PORTFOLIO_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache", "portfolio_prices.json")
-_portfolio_full_cache = None  # full response cache for instant loads
+_portfolio_full_cache = None
 
 def _is_market_open() -> bool:
-    """Return True if US market is currently open (Mon-Fri 9:30-16:00 ET)."""
     from datetime import timezone, timedelta
     now_utc = datetime.now(timezone.utc)
-    # US ET = UTC-5 (EST) or UTC-4 (EDT). Approximate: US market 14:30-21:00 UTC
-    et_offset = timedelta(hours=-4)  # EDT approximation
+    et_offset = timedelta(hours=-4)
     now_et = now_utc + et_offset
-    if now_et.weekday() >= 5:  # Sat/Sun
+    if now_et.weekday() >= 5:
         return False
     market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
     market_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
     return market_open <= now_et <= market_close
 
-def _is_same_trading_day(ts: float) -> bool:
-    """Check if cached timestamp is from the same trading day."""
-    from datetime import timezone, timedelta
-    now = datetime.now()
-    cached_dt = datetime.fromtimestamp(ts)
-    # If within same calendar day and after market open, it's same trading day
-    if now.date() == cached_dt.date():
-        return True
-    # Handle weekends: Friday cache valid through Sunday
-    if cached_dt.weekday() == 4 and now.weekday() >= 5 and (now - cached_dt).days <= 2:
-        return True
-    return False
+def _load_portfolio_cache(db: Session):
+    rows = db.query(MarketPrice).all()
+    latest = {}
+    for r in rows:
+        if r.ticker not in latest or r.date > latest[r.ticker]["date"]:
+            latest[r.ticker] = {"ts": 0, "price": r.close_price, "name": r.name, "change_pct": r.change_pct, "date": r.date}
+    return {t: {"ts": v["ts"], "price": v["price"], "name": v["name"], "change_pct": v["change_pct"]} for t, v in latest.items()}
 
-def _load_portfolio_cache():
-    if os.path.exists(PORTFOLIO_CACHE_FILE):
-        try:
-            with open(PORTFOLIO_CACHE_FILE) as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {}
-
-def _save_portfolio_cache(cache):
-    os.makedirs(os.path.dirname(PORTFOLIO_CACHE_FILE), exist_ok=True)
-    with open(PORTFOLIO_CACHE_FILE, "w") as f:
-        json.dump(cache, f)
+def _save_portfolio_cache(cache: dict, db: Session):
+    from datetime import date
+    today = date.today().isoformat()
+    for ticker, info in cache.items():
+        price = info.get("price")
+        if price is None: continue
+        existing = db.query(MarketPrice).filter(MarketPrice.ticker == ticker, MarketPrice.date == today).first()
+        if existing:
+            existing.close_price = price
+            existing.change_pct = info.get("change_pct")
+            existing.name = info.get("name")
+            existing.source = "api"
+            existing.updated_at = _now()
+        else:
+            db.add(MarketPrice(ticker=ticker, date=today, close_price=price, change_pct=info.get("change_pct"), name=info.get("name"), source="api", updated_at=_now()))
+    db.commit()
 
 @app.get("/api/portfolio")
 def api_portfolio(refresh: bool = False, db: Session = Depends(get_db)):
@@ -1173,7 +1480,7 @@ def api_portfolio(refresh: bool = False, db: Session = Depends(get_db)):
             holdings[key]["total_cost"] -= r.total_amount - (r.fees or 0)
 
     # Load price cache
-    cache = {} if refresh else _load_portfolio_cache()
+    cache = {} if refresh else _load_portfolio_cache(db)
     need_refresh = refresh
 
     result = []
@@ -1230,7 +1537,7 @@ def api_portfolio(refresh: bool = False, db: Session = Depends(get_db)):
         result.append(item)
 
     if cache:
-        _save_portfolio_cache(cache)
+        _save_portfolio_cache(cache, db)
 
     # ── Portfolio summary (all values in CNY) ────────
     total_cost_cny = 0
@@ -1281,24 +1588,39 @@ def api_portfolio(refresh: bool = False, db: Session = Depends(get_db)):
     return {"holdings": result, "summary": summary}
 
 
-PERFORMANCE_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache", "performance_cache.json")
+def _load_performance_cache(db: Session):
+    rows = db.query(PerformanceSnapshot).order_by(PerformanceSnapshot.date).all()
+    if not rows:
+        return {}
+    return {
+        "dates": [r.date for r in rows],
+        "portfolio": [r.portfolio_pct for r in rows],
+        "qqq": [r.qqq_pct for r in rows],
+        "spy": [r.spy_pct for r in rows],
+    }
 
 
-def _load_performance_cache():
-    if os.path.exists(PERFORMANCE_CACHE_FILE):
-        try:
-            with open(PERFORMANCE_CACHE_FILE) as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {}
-
-
-def _save_performance_cache(data):
-    os.makedirs(os.path.dirname(PERFORMANCE_CACHE_FILE), exist_ok=True)
-    data["ts"] = datetime.now().timestamp()
-    with open(PERFORMANCE_CACHE_FILE, "w") as f:
-        json.dump(data, f)
+def _save_performance_cache(data: dict, db: Session):
+    dates = data.get("dates", [])
+    pf = data.get("portfolio", [])
+    qq = data.get("qqq", [])
+    sp = data.get("spy", [])
+    for i, d in enumerate(dates):
+        existing = db.query(PerformanceSnapshot).filter(PerformanceSnapshot.date == d).first()
+        if existing:
+            existing.portfolio_pct = pf[i] if i < len(pf) else None
+            existing.qqq_pct = qq[i] if i < len(qq) else None
+            existing.spy_pct = sp[i] if i < len(sp) else None
+            existing.updated_at = _now()
+        else:
+            db.add(PerformanceSnapshot(
+                date=d,
+                portfolio_pct=pf[i] if i < len(pf) else None,
+                qqq_pct=qq[i] if i < len(qq) else None,
+                spy_pct=sp[i] if i < len(sp) else None,
+                updated_at=_now(),
+            ))
+    db.commit()
 
 
 @app.get("/api/portfolio/performance")
@@ -1311,12 +1633,10 @@ def api_portfolio_performance(refresh: bool = False, db: Session = Depends(get_d
 
     # Use cache when available and not forcing refresh
     if not refresh:
-        cached = _load_performance_cache()
+        cached = _load_performance_cache(db)
         if cached.get("dates"):
-            cache_ts = cached.get("ts", 0)
-            if not _is_market_open() or _is_same_trading_day(cache_ts):
-                return {"dates": cached["dates"], "portfolio": cached["portfolio"],
-                        "qqq": cached.get("qqq", []), "spy": cached.get("spy", [])}
+            return {"dates": cached["dates"], "portfolio": cached["portfolio"],
+                    "qqq": cached.get("qqq", []), "spy": cached.get("spy", [])}
 
     rows = db.query(InvestmentRecord).order_by(InvestmentRecord.date).all()
     if not rows:
@@ -1341,7 +1661,7 @@ def api_portfolio_performance(refresh: bool = False, db: Session = Depends(get_d
 
     if not closes:
         # Return cached data as fallback
-        cached = _load_performance_cache()
+        cached = _load_performance_cache(db)
         if cached.get("dates"):
             return {"dates": cached["dates"], "portfolio": cached["portfolio"],
                     "qqq": cached.get("qqq", []), "spy": cached.get("spy", [])}
@@ -1410,7 +1730,76 @@ def api_portfolio_performance(refresh: bool = False, db: Session = Depends(get_d
         spy_pct = [round((float(closes["SPY"].iloc[i]) / spy0 - 1) * 100, 2) for i in range(len(df))]
 
     result = {"dates": dates, "portfolio": port_pct, "qqq": qqq_pct, "spy": spy_pct}
-    _save_performance_cache(result)
+    _save_performance_cache(result, db)
+    return result
+
+
+@app.get("/api/resolve-type/{code}")
+def api_resolve_type(code: str, db: Session = Depends(get_db)):
+    """Auto-detect asset type + name. Saves name to market_prices for future use."""
+    import httpx as _httpx
+    result = {"type": "stock", "currency": "USD", "name": None}
+
+    # Chinese 6-digit code: query East Money
+    if code.isdigit() and len(code) == 6:
+        try:
+            resp = _httpx.get(
+                "https://searchapi.eastmoney.com/api/suggest/get",
+                params={"input": code, "type": 14, "token": "D43BF722C8E33BDC906FB84D85E326E8"},
+                headers={"User-Agent": "Mozilla/5.0"}, timeout=10.0
+            )
+            data = resp.json()
+            if data.get("QuotationCodeTable"):
+                r = data["QuotationCodeTable"]["Data"][0]
+                sec_type = r.get("SecurityTypeName", "")
+                name = r.get("Name", "")
+                mkt = r.get("Market", "")
+                type_map = {
+                    "深A": "stock", "沪A": "stock", "深B": "stock", "沪B": "stock",
+                    "创业板": "stock", "科创板": "stock",
+                    "开放式基金": "fund", "基金": "fund", "ETF": "etf", "LOF": "fund",
+                    "港股": "stock", "美股": "stock",
+                }
+                asset_type = type_map.get(sec_type, "fund" if mkt == "0" else "stock")
+                currency = "CNY"
+                if mkt in ("116", "105", "106", "107"): currency = "USD"
+                elif mkt == "155": currency = "HKD"
+                result = {"type": asset_type, "currency": currency, "name": name}
+        except Exception:
+            result = {"type": "fund", "currency": "CNY", "name": None}
+    else:
+        # Letter ticker: query Tencent
+        try:
+            resp = _httpx.get(f"https://qt.gtimg.cn/q=us{code.upper()}",
+                              headers={"User-Agent": "Mozilla/5.0"}, timeout=10.0)
+            text = resp.text
+            import re
+            m = re.search(r'="([^"]+)"', text)
+            if m:
+                fields = m.group(1).split("~")
+                name = fields[1] if len(fields) > 1 and fields[1] else code.upper()
+                price = None
+                try: price = float(fields[3]) if fields[3] else None
+                except: pass
+                sec_type = fields[55] if len(fields) > 55 else ""
+                is_etf = "ETF" in sec_type or "ETF" in name
+                result = {"type": "etf" if is_etf else "stock", "currency": "USD", "name": name, "price": price}
+        except Exception:
+            pass
+
+    # Save name to market_prices for future lookups
+    if result.get("name"):
+        existing = db.query(MarketPrice).filter(MarketPrice.ticker == code).first()
+        if existing:
+            if not existing.name or existing.name == code:
+                existing.name = result["name"]
+                db.commit()
+        else:
+            from datetime import date
+            db.add(MarketPrice(ticker=code, date=date.today().isoformat(),
+                               close_price=0, name=result["name"], source="resolver"))
+            db.commit()
+
     return result
 
 
@@ -1522,6 +1911,62 @@ def _fetch_fund_price(code: str):
         return None, None, None
 
 
+def _fetch_sina_price(symbol: str):
+    """Fetch current price from Sina Finance (国内可访问). Returns (price, name, change_pct)."""
+    import httpx as _httpx, re
+    sid = f"gb_{symbol.lower()}"  # US stocks
+    try:
+        resp = _httpx.get(f"https://hq.sinajs.cn/list={sid}",
+                          headers={"Referer": "https://finance.sina.com.cn"}, timeout=10.0)
+        resp.raise_for_status()
+        text = resp.text
+        m = re.search(r'="([^"]+)"', text)
+        if not m: return None, None, None
+        fields = m.group(1).split(",")
+        if len(fields) < 2 or not fields[1] or fields[1] == "0.0000": return None, None, None
+        name = fields[0]
+        price = float(fields[1])
+        chg = round(float(fields[2]) / price * 100, 2) if len(fields) > 2 and fields[2] and float(fields[2]) != 0 else None
+        print(f"[sina] {sid} ({name}) = {price:.2f}  {chg:+.2f}%" if chg else f"[sina] {sid} ({name}) = {price:.2f}")
+        return price, name, chg
+    except Exception as e:
+        print(f"[sina] Failed for {sid}: {e}")
+        return None, None, None
+
+
+def _fetch_tencent_price(symbol: str):
+    """Fetch price from Tencent Finance (国内可访问，中文名称好). Returns (price, name, change_pct)."""
+    import httpx as _httpx, re
+    sid = f"us{symbol.upper()}"
+    try:
+        resp = _httpx.get(f"https://qt.gtimg.cn/q={sid}",
+                          headers={"User-Agent": "Mozilla/5.0"}, timeout=10.0)
+        resp.raise_for_status()
+        text = resp.text
+        m = re.search(r'="([^"]+)"', text)
+        if not m: return None, None, None
+        fields = m.group(1).split("~")
+        # Tencent format for US: ~name~code~price~... with many fields
+        if len(fields) < 4: return None, None, None
+        name = fields[1] if fields[1] else symbol.upper()
+        try:
+            price = float(fields[3])
+        except (ValueError, IndexError):
+            return None, None, None
+        if price <= 0: return None, None, None
+        chg = None
+        try:
+            if len(fields) > 32 and fields[32]:
+                chg = round(float(fields[32]), 2)
+        except (ValueError, IndexError):
+            pass
+        print(f"[tencent] {sid} ({name}) = {price:.2f}  {chg:+.2f}%" if chg else f"[tencent] {sid} ({name}) = {price:.2f}")
+        return price, name, chg
+    except Exception as e:
+        print(f"[tencent] Failed for {sid}: {e}")
+        return None, None, None
+
+
 def _fetch_price(symbol: str, currency: str, db: Session, asset_type: str = "stock"):
     """Fetch current price. Returns (price, price_cny, name, change_pct).
 
@@ -1550,6 +1995,14 @@ def _fetch_price(symbol: str, currency: str, db: Session, asset_type: str = "sto
     if asset_type in ("bond", "option", "future", "forex", "index", "commodity", "cash", "other"):
         print(f"[portfolio] {asset_type}:{symbol} — no live price API, manual only")
         return None, None, None, None
+
+    # ── US stock path: Tencent first (better names), Sina fallback ──
+    if asset_type in ("stock", "etf") and not symbol.isdigit():
+        for fetcher in [_fetch_tencent_price, _fetch_sina_price]:
+            price, name, chg = fetcher(symbol)
+            if price is not None:
+                cny_price = convert_to_cny(price, currency, db)["value"] if currency.upper() != "CNY" else price
+                return round(price, 2), round(cny_price, 2), name, chg
 
     target = _resolve_secid(symbol, asset_type)
     if target is None:
@@ -1619,6 +2072,48 @@ def _fetch_price(symbol: str, currency: str, db: Session, asset_type: str = "sto
         except Exception as e:
             print(f"[portfolio] Price fetch failed for {sid}: {e}")
             continue
+
+    # ── Fallback: Sina/Tencent for Chinese A-shares ──
+    if symbol.isdigit() and len(symbol) == 6:
+        import httpx as _httpx, re
+        exchange = "sz" if symbol.startswith(("0", "3")) else "sh"
+        txt_sid = f"{exchange}{symbol}"
+        for base_url in ["https://qt.gtimg.cn/q=", "https://hq.sinajs.cn/list="]:
+            try:
+                resp = _httpx.get(f"{base_url}{txt_sid}",
+                                  headers={"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn"},
+                                  timeout=10.0)
+                resp.raise_for_status()
+                m = re.search(r'="([^"]+)"', resp.text)
+                if m:
+                    fields = m.group(1).split(",")
+                    name = fields[0]
+                    # Sina: fields=[name, open, prev_close, price, high, low, ...]
+                    # Tencent: fields=[market, name, code, price, prev_close, open, ...]
+                    if len(fields) > 3 and fields[3]:
+                        px = None
+                        prev_close = None
+                        if "qt.gtimg" in base_url:
+                            # Tencent: field 3=price, field 4=prev_close
+                            try: px = float(fields[3])
+                            except: pass
+                            try: prev_close = float(fields[4])
+                            except: pass
+                        else:
+                            # Sina: field 3=price, field 2=prev_close
+                            try: px = float(fields[3])
+                            except: pass
+                            try: prev_close = float(fields[2])
+                            except: pass
+                        if px and px > 0:
+                            chg = None
+                            if prev_close and prev_close > 0:
+                                chg = round((px - prev_close) / prev_close * 100, 2)
+                            print(f"[A-share] {txt_sid} ({name}) = {px:.2f}  {chg:+.2f}%" if chg else f"[A-share] {txt_sid} ({name}) = {px:.2f}")
+                            cny_price = px
+                            return round(px, 2), round(cny_price, 2), name, chg
+            except Exception as e:
+                pass
 
     # ── Fallback: yfinance for non-Chinese tickers ──
     if asset_type in ("stock", "etf") and not symbol.isdigit():

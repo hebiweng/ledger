@@ -156,10 +156,41 @@ class DcaPlan(Base):
     account_id = Column(Integer, ForeignKey("accounts.id"), nullable=True)  # investment account
     payment_account = Column(Integer, ForeignKey("accounts.id"), nullable=True)  # funding source
     frequency = Column(String, default="monthly")  # weekly, biweekly, monthly
+    start_date = Column(String, nullable=True)  # original start date
     next_date = Column(String, nullable=False)  # next execution date
     is_active = Column(Integer, default=1)
     notes = Column(String, default="")
     created_at = Column(String, default=_now)
+    updated_at = Column(String, default=_now)
+
+
+class MarketPrice(Base):
+    __tablename__ = "market_prices"
+
+    ticker = Column(String, primary_key=True, nullable=False)
+    date = Column(String, primary_key=True, nullable=False)  # YYYY-MM-DD
+    close_price = Column(Float, nullable=False)
+    change_pct = Column(Float, nullable=True)  # daily change %
+    name = Column(String, nullable=True)  # security display name
+    source = Column(String, default="manual")  # eastmoney / sina / coingecko / yfinance / backtest / manual
+    updated_at = Column(String, default=_now)
+
+
+class TradingCalendar(Base):
+    __tablename__ = "trading_calendar"
+
+    date = Column(String, primary_key=True, nullable=False)
+    market = Column(String, primary_key=True, nullable=False)  # US / CN / HK
+    is_trading = Column(Integer, default=1)
+
+
+class PerformanceSnapshot(Base):
+    __tablename__ = "performance_snapshots"
+
+    date = Column(String, primary_key=True, nullable=False)
+    portfolio_pct = Column(Float, nullable=True)
+    qqq_pct = Column(Float, nullable=True)
+    spy_pct = Column(Float, nullable=True)
     updated_at = Column(String, default=_now)
 
 

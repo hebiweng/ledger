@@ -31,12 +31,76 @@ def _cache_dir():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
 
 
+def _load_from_market_prices(tickers, start, end):
+    """Try loading price data from the unified market_prices table."""
+    try:
+        import sqlite3
+        conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.abspath(__file__)), "ledger.db"))
+        placeholders = ','.join(['?'] * len(tickers))
+        cur = conn.execute(
+            f"SELECT ticker, date, close_price FROM market_prices WHERE ticker IN ({placeholders}) AND date >= ? AND date <= ? ORDER BY date",
+            (*tickers, start, end)
+        )
+        rows = cur.fetchall()
+        conn.close()
+        if not rows:
+            return None
+        data = {}
+        for ticker, date, price in rows:
+            if ticker not in data:
+                data[ticker] = {}
+            data[ticker][date] = price
+        df = pd.DataFrame(data)
+        df.index = pd.to_datetime(df.index)
+        df = df.sort_index()
+        cols = set(df.columns)
+        if cols >= set(tickers):
+            c_start = df.index[0].strftime("%Y-%m-%d")
+            c_end = df.index[-1].strftime("%Y-%m-%d")
+            if c_start <= start and c_end >= end:
+                return df.loc[start:end][list(tickers)]
+    except Exception as e:
+        print(f"  DB read skipped: {e}")
+    return None
+
+
+def _save_to_market_prices(df):
+    """Save fetched price data into market_prices table."""
+    try:
+        import sqlite3
+        conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.abspath(__file__)), "ledger.db"))
+        cur = conn.cursor()
+        count = 0
+        for date, row in df.iterrows():
+            date_str = date.strftime("%Y-%m-%d") if hasattr(date, 'strftime') else str(date)[:10]
+            for ticker in df.columns:
+                px = float(row[ticker])
+                if pd.notna(px) and px > 0:
+                    cur.execute(
+                        'INSERT OR IGNORE INTO market_prices(ticker, date, close_price, source, updated_at) VALUES(?,?,?,?,datetime("now"))',
+                        (ticker, date_str, px, 'yfinance')
+                    )
+                    count += 1
+        conn.commit()
+        conn.close()
+        if count > 0:
+            print(f"  Saved {count} rows to market_prices")
+    except Exception as e:
+        print(f"  DB save skipped: {e}")
+
+
 def fetch_data(tickers, start, end, cache_key=None):
-    """Fetch close prices for a list of tickers. Uses local CSV cache."""
+    """Fetch close prices for a list of tickers. Uses market_prices DB → CSV → yfinance."""
     cdir = _cache_dir()
     os.makedirs(cdir, exist_ok=True)
 
-    # Check for named cache files first (real/sim)
+    # 1. Try unified market_prices DB table
+    db_df = _load_from_market_prices(tickers, start, end)
+    if db_df is not None:
+        print(f"  Using DB: market_prices table")
+        return db_df
+
+    # 2. Fall back to named CSV cache (legacy)
     for prefix in ["real", "sim"]:
         cf = f"cache_{prefix}.csv"
         cp = os.path.join(cdir, cf)
@@ -48,28 +112,33 @@ def fetch_data(tickers, start, end, cache_key=None):
                 c_start = cached.index[0].strftime("%Y-%m-%d")
                 c_end = cached.index[-1].strftime("%Y-%m-%d")
                 if c_start <= start and c_end >= end:
-                    print(f"  Using cache: {cp}")
+                    print(f"  Using legacy CSV: {cp}")
                     return cached.loc[start:end][list(tickers)]
 
+    # 3. Session CSV cache
     if cache_key:
         cache_path = os.path.join(cdir, f"cache_{cache_key}.csv")
         if os.path.exists(cache_path):
-            print(f"  Loading from cache: {cache_path}")
+            print(f"  Loading from CSV cache: {cache_path}")
             df = pd.read_csv(cache_path, index_col=0)
             df.index = pd.to_datetime(df.index, utc=True).tz_convert(None)
             return df
     else:
         cache_path = None
 
+    # 4. Fetch from yfinance
     closes = {}
     for t in tickers:
         print(f"  Fetching {t}...")
         closes[t] = _fetch_one(t, start, end)
     result = pd.DataFrame(closes).ffill()
 
+    # Save to both session cache and DB
     if cache_path:
         result.to_csv(cache_path)
         print(f"  Cached to {cache_path}")
+    _save_to_market_prices(result)
+
     return result
 
 

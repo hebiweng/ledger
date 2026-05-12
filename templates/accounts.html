@@ -48,10 +48,16 @@ async function loadAccounts() {
   const r = await fetch('/api/accounts'); const data = await r.json();
   document.getElementById('accList').innerHTML = data.map(a => {
     if (window._editing === a.id) {
+      var currencies = a.multi && a.currencies ? a.currencies.map(function(c) {
+        return { id: c.id, currency: c.currency };
+      }) : [{ id: a.id, currency: a.currency || '' }];
+      var currHtml = '<div id="currList-' + a.id + '">' + currencies.map(function(c) {
+        return '<div style="display:flex;gap:4px;align-items:center;margin-bottom:2px;"><input class="edit-multi-curr" value="' + c.currency + '" data-id="' + c.id + '" style="width:60px;"><button class="btn btn-danger btn-xs" onclick="removeCurrencyRow(this,\'' + c.id + '\')" style="font-size:10px;padding:0 6px;">×</button></div>';
+      }).join('') + '<button class="btn btn-secondary btn-xs" onclick="addCurrencyRow(' + a.id + ')" style="margin-top:2px;">+ 币种</button></div>';
       return `<tr>
         <td><input id="editName" value="${a.name}" style="width:110px;"></td>
         <td><select id="editType" style="width:100px;">${Object.entries(typeLabels).map(([v,l]) => `<option value="${v}" ${a.type===v?'selected':''}>${l}</option>`).join('')}</select></td>
-        <td>${a.multi ? '<span class="badge badge-blue">多币种</span>' : a.currency}</td>
+        <td style="font-size:12px;">${currHtml}</td>
         <td>${a.is_active ? '<span class="badge badge-green">在用</span>' : '<span class="badge badge-gray">停用</span>'}</td>
         <td><button class="btn btn-primary btn-xs" onclick="saveEdit(${a.id})">💾 保存</button>
             <button class="btn btn-secondary btn-xs" onclick="cancelEdit()">取消</button></td>
@@ -90,13 +96,75 @@ async function saveEdit(id) {
   const name = document.getElementById('editName').value.trim();
   const type = document.getElementById('editType').value;
   if (!name) return toast('请输入账户名', 'err');
-  await fetch(`/api/accounts/${id}`, {
+
+  // Collect currencies from edit rows
+  const multiCurrs = document.querySelectorAll('.edit-multi-curr');
+  var currencies = [];
+  for (const inp of multiCurrs) {
+    var c = inp.value.trim().toUpperCase();
+    if (c) currencies.push({ id: inp.dataset.id, currency: c });
+  }
+
+  // Save existing sub-account currencies
+  for (const c of currencies) {
+    if (c.id && c.id !== 'new') {
+      await fetch('/api/accounts/' + c.id, {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ currency: c.currency })
+      });
+    }
+  }
+
+  // Add new currencies — may convert single → multi
+  for (const c of currencies) {
+    if (!c.id || c.id === 'new') {
+      var r = await fetch('/api/accounts/' + id + '/add-currency', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ currency: c.currency })
+      });
+      // If converted, add-currency changed parent; update id for name/type save
+      var result = await r.json();
+      if (result.converted && result.parent_id) id = result.parent_id;
+    }
+  }
+
+  // Save name/type on main account
+  var body = { name: name, type: type };
+  if (currencies.length === 1 && !document.querySelector('.edit-multi-curr[data-id]')) {
+    // Still single-currency: save currency too
+    body.currency = currencies[0] ? currencies[0].currency : undefined;
+  }
+
+  await fetch('/api/accounts/' + id, {
     method: 'PUT',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ name, type })
+    body: JSON.stringify(body)
   });
   window._editing = null;
   loadAccounts();
+}
+
+function addCurrencyRow(accId) {
+  var list = document.getElementById('currList-' + accId);
+  var div = document.createElement('div');
+  div.style.cssText = 'display:flex;gap:4px;align-items:center;margin-bottom:2px;';
+  div.innerHTML = '<input class="edit-multi-curr" value="" placeholder="JPY" style="width:60px;" data-id="new"><button class="btn btn-danger btn-xs" onclick="this.parentElement.remove()" style="font-size:10px;padding:0 6px;">×</button>';
+  list.insertBefore(div, list.lastElementChild);
+}
+
+function removeCurrencyRow(btn, subId) {
+  if (subId !== 'new' && subId) {
+    // Existing sub-account - delete via API
+    showConfirm('删除币种', '确定删除吗？', async function() {
+      await fetch('/api/accounts/' + subId, { method: 'DELETE' });
+      btn.parentElement.remove();
+    });
+  } else {
+    // New row that hasn't been saved yet - just remove
+    btn.parentElement.remove();
+  }
 }
 
 async function addAccount() {

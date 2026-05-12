@@ -164,8 +164,8 @@ function renderBalanceTable(items, portfolioVal) {
     if (it.multi && it.subs) {
       // Multi-currency: show parent row + expandable sub-rows
       html += `<tr style="cursor:pointer;" onclick="toggleSubRows(${it.account_id})">
-        <td><span class="account-link">${it.account_name}</span> ${badge}<span class="badge badge-blue" style="margin-left:4px;">多币种</span></td>
-        <td><span style="font-size:11px;color:var(--sumi-light);">${it.subs.map(s => s.currency).join('/')}</span></td>
+        <td><a href="javascript:void(0)" onclick="event.stopPropagation();showAccountDetail(${it.account_id})" class="account-link">${it.account_name}</a> ${badge}</td>
+        <td><span class="badge badge-blue" style="margin-right:4px;">多币种</span><span style="font-size:11px;color:var(--sumi-light);">${it.subs.map(s => s.currency).join('/')}</span></td>
         <td style="color:var(--sumi-light);">—</td>
         <td style="font-weight:600;">¥${it.balance_cny != null ? it.balance_cny.toLocaleString() : '—'}</td>
         <td style="font-weight:500;">¥${it.balance_cny != null ? it.balance_cny.toLocaleString() : '—'}</td>

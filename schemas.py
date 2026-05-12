@@ -7,6 +7,7 @@ class AccountCreate(BaseModel):
     type: str
     currency: str = "CNY"
     currencies: Optional[list[str]] = None
+    parent_id: Optional[int] = None
     is_active: int = 1
     sort_order: int = 0
     notes: str = ""

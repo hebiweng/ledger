@@ -1,6 +1,13 @@
 ﻿{% extends "base.html" %}
 {% block content %}
 
+<style>
+.overlay.closing { animation: slideDown .15s ease-in forwards; }
+@keyframes slideDown { from { opacity: 1; transform: translateY(0); } to { opacity: 0; transform: translateY(10px); } }
+.undo-btn { background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.35); color: #fff; padding: 2px 10px; border-radius: 100px; cursor: pointer; margin-left: 8px; font-size: 12px; font-weight: 500; }
+.undo-btn:hover { background: rgba(255,255,255,0.3); }
+</style>
+
 <!-- Investment summary -->
 <div class="card">
   <div class="card-header">投资总览</div>
@@ -126,6 +133,32 @@ const atypeColors = { stock:'badge-blue', etf:'badge-teal', fund:'badge-green', 
 function atypeLabel(t) { return atypeLabels[t] || t; }
 function atypeBadge(t) { return atypeColors[t] || 'badge-gray'; }
 let investAccounts = [], allAccounts = [];
+let _undoDelete = null, _undoTimer = null;
+
+function closeOverlay(el) {
+  el.classList.add('closing');
+  setTimeout(() => { el.classList.remove('closing'); el.style.display = 'none'; }, 150);
+}
+
+function undoableDelete(data, deleteFn) {
+  _undoDelete = { data, deleteFn, executed: false };
+  const el = document.getElementById('toast');
+  el.innerHTML = '已删除 <button class="undo-btn" id="undoBtn">撤销</button>';
+  el.style.display = 'block'; el.style.background = '#C04540'; el.style.color = '#fff';
+  clearTimeout(el._timer);
+  el._timer = setTimeout(() => { el.style.display = 'none'; _undoDelete = null; }, 5000);
+  document.getElementById('undoBtn').onclick = async () => {
+    clearTimeout(el._timer);
+    el.style.display = 'none';
+    if (_undoDelete && !_undoDelete.executed) {
+      _undoDelete.executed = true;
+      try { await _undoDelete.deleteFn(); } catch(e) {}
+      loadInvestments(); loadPortfolio(true); loadSummary();
+      toast('已撤销', 'ok');
+    }
+    _undoDelete = null;
+  };
+}
 
 async function autoFillName(inputEl) {
   const code = inputEl.value.trim().toUpperCase();
@@ -585,7 +618,7 @@ async function saveDca() {
   const method = editId ? 'PUT' : 'POST';
   const r = await fetch(url, { method, headers:{'Content-Type':'application/json'}, body:JSON.stringify(body) });
   const saved = await r.json();
-  document.getElementById('dcaDialog').style.display = 'none';
+  closeOverlay(document.getElementById('dcaDialog'));
 
   // Auto backfill if start date is in the past
   const startDate = document.getElementById('dcaStartDate').value;
@@ -631,8 +664,7 @@ async function confirmExecuteDca() {
   const url = `/api/dca-plans/${id}/execute?${params}`;
   const r = await fetch(url, { method:'POST' });
   const result = await r.json();
-  document.getElementById('dcaExecDialog').style.display = 'none';
-  // overlay is dcaExecDialog itself
+  closeOverlay(document.getElementById('dcaExecDialog'));
   loadDcaPlans(); loadInvestments(); loadPortfolio(true); loadSummary();
   if (result.balance_ok === false) {
     toast('定投已执行，但扣款账户余额不足！', 'warn');
@@ -641,13 +673,27 @@ async function confirmExecuteDca() {
   }
 }
 function closeExecDialog() {
-  document.getElementById('dcaExecDialog').style.display = 'none';
-  // overlay is dcaExecDialog itself
+  closeOverlay(document.getElementById('dcaExecDialog'));
 }
 
 async function deactivateDca(id) {
+  const plan = allDcaPlans.find(x => x.id === id);
+  if (!plan) return;
   showConfirm('停用定投', '确定停用？', async () => {
     await fetch(`/api/dca-plans/${id}`, { method:'DELETE' });
+    undoableDelete(plan, async () => {
+      await fetch('/api/dca-plans', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          asset_name: plan.asset_name, asset_type: plan.asset_type,
+          amount: plan.amount, fees: plan.fees || 0, currency: plan.currency,
+          frequency: plan.frequency, next_date: plan.next_date,
+          platform: plan.platform, account_id: plan.account_id,
+          payment_account: plan.payment_account, is_active: plan.is_active
+        })
+      });
+    });
     loadDcaPlans(); toast('已停用', 'ok');
   });
 }
@@ -740,9 +786,24 @@ async function loadInvestments() {
 }
 
 async function deleteInvestment(id) {
-  showConfirm('删除', '确定删除？', async () => {
-    await fetch(`/api/investments/${id}`, { method:'DELETE' });
-    toast('已删除','ok'); loadInvestments(); loadPortfolio(true); loadSummary();
+  const inv = (window._allInvestments || []).find(x => x.id === id);
+  if (!inv) return;
+  showConfirm('删除', '确定删除这条交易记录吗？', async () => {
+    await fetch(`/api/investments/${id}`, { method: 'DELETE' });
+    undoableDelete(inv, async () => {
+      await fetch('/api/investments', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          date: inv.date, type: inv.type, asset_name: inv.asset_name,
+          asset_type: inv.asset_type, quantity: inv.quantity,
+          price: inv.price, fees: inv.fees, total_amount: inv.total_amount,
+          currency: inv.currency, platform: inv.platform,
+          account_id: inv.account_id, notes: inv.notes
+        })
+      });
+    });
+    loadInvestments(); loadPortfolio(true); loadSummary();
   });
 }
 
@@ -849,7 +910,7 @@ async function confirmTransfer() {
   const result = await r.json();
   if (!r.ok) return toast(result.detail, 'err');
   toast(result.msg, 'ok');
-  document.getElementById('transferDialog').style.display = 'none';
+  closeOverlay(document.getElementById('transferDialog'));
   loadInvestments(); loadPortfolio(true); loadBalances(); loadSummary();
 }
 
@@ -916,7 +977,7 @@ init();
     </div>
     <div class="confirm-actions" style="margin-top:14px;">
       <input type="hidden" id="dcaEditId" value="">
-      <button class="btn btn-secondary btn-sm" onclick="document.getElementById('dcaDialog').style.display='none'">取消</button>
+      <button class="btn btn-secondary btn-sm" onclick="closeOverlay(document.getElementById('dcaDialog'))">取消</button>
       <button class="btn btn-primary btn-sm" onclick="saveDca()">保存</button>
     </div>
   </div>
@@ -935,7 +996,7 @@ init();
     </div>
     <input type="hidden" id="tfFromId">
     <div class="confirm-actions">
-      <button class="btn btn-secondary btn-sm" onclick="document.getElementById('transferDialog').style.display='none'">取消</button>
+      <button class="btn btn-secondary btn-sm" onclick="closeOverlay(document.getElementById('transferDialog'))">取消</button>
       <button class="btn btn-primary btn-sm" onclick="confirmTransfer()">确认转账</button>
     </div>
   </div>
