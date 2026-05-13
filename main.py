@@ -4,7 +4,9 @@ import os
 from contextlib import asynccontextmanager
 from datetime import datetime
 
+import asyncio
 from fastapi import FastAPI, Depends, HTTPException, Form, UploadFile, File
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -31,6 +33,8 @@ from schemas import (
 from exchange_rate import get_rate, convert_to_cny, refresh_all_rates
 from recurring import ensure_expenses_for_month
 
+_last_market_refresh = 0  # timestamp of last market data refresh
+
 
 def _now():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -51,6 +55,7 @@ async def lifespan(app: FastAPI):
     try:
         seed_categories(db)
         refresh_all_rates(db)
+        start_market_refresh_scheduler()
     finally:
         db.close()
     yield
@@ -124,18 +129,37 @@ def page_investment3(db: Session = Depends(get_db)):
         else:
             holdings[key]["quantity"] -= (r.quantity or 0)
             holdings[key]["total_cost"] -= r.total_amount - (r.fees or 0)
+            holdings[key]["total_fees"] += (r.fees or 0)
     portfolio_holdings = []
     total_cost_cny = 0.0
-    total_fees_raw = 0.0
+    total_fees_cny = 0.0
     for h in holdings.values():
         if h["quantity"] <= 0: continue
         avg = h["total_cost"] / h["quantity"]
-        total_cost_cny += h["total_cost"]
-        total_fees_raw += h["total_fees"]
+        if h["currency"] == "CNY":
+            total_cost_cny += h["total_cost"]
+            total_fees_cny += h["total_fees"]
+        else:
+            cost_conv = convert_to_cny(h["total_cost"], h["currency"], db)
+            total_cost_cny += cost_conv["value"] if cost_conv["valid"] and cost_conv["rate"] is not None else 0
+            fees_conv = convert_to_cny(h["total_fees"], h["currency"], db)
+            total_fees_cny += fees_conv["value"] if fees_conv["valid"] and fees_conv["rate"] is not None else 0
         portfolio_holdings.append({"asset_name": h["asset_name"], "asset_type": h["asset_type"], "currency": h["currency"], "quantity": round(h["quantity"], 4), "total_cost": round(h["total_cost"], 2), "avg_cost": round(avg, 2), "total_fees": round(h["total_fees"], 2)})
 
     price_cache = _load_portfolio_cache(db)
-    total_value = 0.0
+    # Load recent MarketPrice close-to-close for daily P&L
+    from collections import defaultdict as _dd
+    _mp_close = _dd(list)
+    if portfolio_holdings:
+        _all_mp = db.query(MarketPrice).filter(
+            MarketPrice.ticker.in_([h["asset_name"] for h in portfolio_holdings])
+        ).order_by(MarketPrice.date.desc()).all()
+        for _mp in _all_mp:
+            if _mp.close_price:
+                _mp_close[_mp.ticker].append(_mp.close_price)
+
+    total_value_cny = 0.0
+    daily_pnl_cny = 0.0
     has_prices = False
     for h in portfolio_holdings:
         cached = price_cache.get(h["asset_name"])
@@ -145,9 +169,23 @@ def page_investment3(db: Session = Depends(get_db)):
             h["current_value"] = round(h["quantity"] * px, 2)
             h["profit"] = round(h["current_value"] - h["total_cost"], 2)
             h["profit_pct"] = round(h["profit"] / h["total_cost"] * 100, 2) if h["total_cost"] > 0 else 0
-            h["change_pct"] = cached.get("change_pct")
+            change_pct = cached.get("change_pct")
+            h["change_pct"] = change_pct
             h["display_name"] = cached.get("name")
-            total_value += h["current_value"]
+            if h["currency"] == "CNY":
+                val_cny = h["current_value"]
+            else:
+                val_conv = convert_to_cny(h["current_value"], h["currency"], db)
+                val_cny = val_conv["value"] if val_conv["valid"] and val_conv["rate"] is not None else 0
+            total_value_cny += val_cny
+            # Daily P&L: close-to-close from MarketPrice
+            _closes = _mp_close.get(h["asset_name"], [])
+            if len(_closes) >= 2 and _closes[1] > 0:
+                _daily_ret = (_closes[0] - _closes[1]) / _closes[1]
+                _yesterday_val = val_cny / (1 + _daily_ret) if _daily_ret != -1 else 0
+                daily_pnl_cny += _yesterday_val * _daily_ret
+            elif change_pct is not None:
+                daily_pnl_cny += val_cny * change_pct / 100
             has_prices = True
 
     # Latest cache date
@@ -162,13 +200,15 @@ def page_investment3(db: Session = Depends(get_db)):
     summary = {
         "total_cost_cny": round(total_cost_cny, 2),
         "holdings_count": len(portfolio_holdings),
-        "total_fees_cny": round(total_fees_raw, 2),
+        "total_fees_cny": round(total_fees_cny, 2),
         "cache_date": cache_date,
     }
     if has_prices:
-        summary["total_value_cny"] = round(total_value, 2)
-        summary["total_profit_cny"] = round(total_value - total_cost_cny, 2)
-        summary["total_profit_pct"] = round((total_value - total_cost_cny) / total_cost_cny * 100, 2) if total_cost_cny > 0 else 0
+        summary["total_value_cny"] = round(total_value_cny, 2)
+        summary["total_profit_cny"] = round(total_value_cny - total_cost_cny, 2)
+        summary["total_profit_pct"] = round((total_value_cny - total_cost_cny) / total_cost_cny * 100, 2) if total_cost_cny > 0 else 0
+        summary["daily_change_cny"] = round(daily_pnl_cny, 2)
+        summary["daily_change_pct"] = round(daily_pnl_cny / total_value_cny * 100, 2) if total_value_cny > 0 else 0
     else:
         summary["total_value_cny"] = None
         summary["total_profit_cny"] = None
@@ -978,11 +1018,35 @@ def api_dca_execute(plan_id: int, price: float | None = None, note: str | None =
         if acct_bal and acct_bal.balance < plan.amount:
             balance_ok = False
 
+    from datetime import date as dt_date
+    today_str = dt_date.today().isoformat()
     resolved_price = price
     if not resolved_price:
-        p, _, _, _ = _fetch_price(plan.asset_name, plan.currency, db, plan.asset_type)
-        if p:
-            resolved_price = p
+        if plan.next_date < today_str:
+            # Past date: closing price from MarketPrice only (background job fills it)
+            mp = db.query(MarketPrice).filter(
+                MarketPrice.ticker == plan.asset_name,
+                MarketPrice.date == plan.next_date
+            ).first()
+            if mp and mp.close_price:
+                resolved_price = mp.close_price
+            # No external fallback — price stays None, record still created.
+            # User can refresh market data later to fill the price.
+        else:
+            # Today: read from MarketPrice (background job), or fetch now if missing
+            mp = db.query(MarketPrice).filter(
+                MarketPrice.ticker == plan.asset_name,
+                MarketPrice.date == today_str
+            ).first()
+            if mp and mp.close_price:
+                resolved_price = mp.close_price
+            else:
+                # Fetch now and save to MarketPrice for the day
+                p, _, _, _ = _fetch_price(plan.asset_name, plan.currency, db, plan.asset_type)
+                if p:
+                    resolved_price = p
+                    db.add(MarketPrice(ticker=plan.asset_name, date=today_str,
+                                       close_price=p, source="dca", updated_at=_now()))
 
     fee = plan.fees or 0
     invest_amount = plan.amount - fee  # fees deducted from amount
@@ -1115,37 +1179,36 @@ def api_market_prices_create(data: dict, db: Session = Depends(get_db)):
 
 @app.get("/api/refresh-dca-prices")
 def api_refresh_dca_prices(tickers: str = "", db: Session = Depends(get_db)):
-    """Refresh prices for DCA assets even if they have no holdings."""
-    from datetime import date as dt_date
-    today = dt_date.today().isoformat()
+    """Refresh prices for DCA assets. Delegates to incremental refresh."""
+    if not tickers.strip():
+        return {"ok": True, "results": {}}
+    plans = db.query(DcaPlan).filter(DcaPlan.asset_name.in_(
+        [t.strip() for t in tickers.split(",") if t.strip()]
+    )).all()
+    ticker_list = [(p.asset_name, p.asset_type, p.currency) for p in plans]
+    updated = refresh_market_prices(tickers=ticker_list, db=db) if ticker_list else {}
     results = {}
-    for symbol in tickers.split(","):
-        symbol = symbol.strip()
-        if not symbol: continue
-        try:
-            plan = db.query(DcaPlan).filter(DcaPlan.asset_name == symbol).first()
-            asset_type = plan.asset_type if plan else "stock"
-            px, _, name, chg = _fetch_price(symbol, "USD", db, asset_type)
-            if px is not None:
-                existing = db.query(MarketPrice).filter(
-                    MarketPrice.ticker == symbol, MarketPrice.date == today
-                ).first()
-                if existing:
-                    existing.close_price = px
-                    existing.change_pct = chg
-                    existing.name = name
-                    existing.source = "dca-refresh"
-                    existing.updated_at = _now()
-                else:
-                    db.add(MarketPrice(ticker=symbol, date=today, close_price=px,
-                                       change_pct=chg, name=name, source="dca-refresh", updated_at=_now()))
-                db.commit()
-                results[symbol] = {"price": px, "name": name, "ok": True}
-            else:
-                results[symbol] = {"price": None, "name": None, "ok": False, "error": "no data"}
-        except Exception as e:
-            results[symbol] = {"price": None, "name": None, "ok": False, "error": str(e)}
+    for t in tickers.split(","):
+        t = t.strip()
+        if not t: continue
+        results[t] = {"price": updated[t]["price"], "name": updated[t].get("name"),
+                      "ok": t in updated} if t in updated else \
+                     {"price": None, "name": None, "ok": False, "error": "no data"}
     return {"ok": True, "results": results}
+
+
+@app.get("/api/market-events")
+async def api_market_events():
+    """SSE endpoint — pushes 'refreshed' event when background market refresh runs."""
+    async def event_stream():
+        last_ts = _last_market_refresh
+        while True:
+            await asyncio.sleep(3)
+            current = _last_market_refresh
+            if current > last_ts:
+                last_ts = current
+                yield "data: refreshed\n\n"
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @app.get("/api/market-status")
@@ -1157,7 +1220,8 @@ def api_market_status():
     # After 4:00 PM ET = market closed for the day
     market_close = et.replace(hour=16, minute=0, second=0, microsecond=0)
     after_close = et >= market_close and et.weekday() < 5
-    return {"open": _is_market_open(), "closed": after_close}
+    return {"open": _is_market_open(), "closed": after_close,
+            "last_refresh": _last_market_refresh}
 
 
 def api_dca_backfill(plan_id: int, start_date: str = None, holiday: str = "skip", db: Session = Depends(get_db)):
@@ -1479,9 +1543,15 @@ def api_portfolio(refresh: bool = False, db: Session = Depends(get_db)):
             holdings[key]["quantity"] -= (r.quantity or 0)
             holdings[key]["total_cost"] -= r.total_amount - (r.fees or 0)
 
-    # Load price cache
-    cache = {} if refresh else _load_portfolio_cache(db)
-    need_refresh = refresh
+    # Manual refresh: incrementally fetch missing today data → MarketPrice
+    if refresh:
+        ticker_list = [(h["asset_name"], h["asset_type"], h["currency"])
+                       for h in holdings.values() if h["quantity"] > 0]
+        if ticker_list:
+            refresh_market_prices(tickers=ticker_list, db=db)
+
+    # Load price cache from MarketPrice table
+    cache = _load_portfolio_cache(db)
 
     result = []
     for h in holdings.values():
@@ -1504,21 +1574,8 @@ def api_portfolio(refresh: bool = False, db: Session = Depends(get_db)):
         }
         ticker = h["asset_name"]
         cached = cache.get(ticker)
-        # Only fetch external prices when user explicitly clicks "refresh"
-        should_fetch = need_refresh
 
-        if should_fetch:
-            price, price_cny, name, change_pct = _fetch_price(
-                ticker, h["currency"], db, h["asset_type"]
-            )
-            if price is not None:
-                cache[ticker] = {"ts": datetime.now().timestamp(), "price": price,
-                                 "name": name, "change_pct": change_pct}
-            elif cached:
-                price, name, change_pct = cached["price"], cached.get("name"), cached.get("change_pct")
-            else:
-                price = None
-        elif cached:
+        if cached:
             price = cached["price"]
             name = cached.get("name")
             change_pct = cached.get("change_pct")
@@ -1536,10 +1593,27 @@ def api_portfolio(refresh: bool = False, db: Session = Depends(get_db)):
                 item["change_pct"] = change_pct
         result.append(item)
 
-    if cache:
-        _save_portfolio_cache(cache, db)
+    # Pre-compute CNY values for each holding (used by pie chart + summary)
+    for it in result:
+        if it["current_value"] is not None:
+            if it["currency"] == "CNY":
+                it["current_value_cny"] = it["current_value"]
+            else:
+                conv = convert_to_cny(it["current_value"], it["currency"], db)
+                it["current_value_cny"] = round(conv["value"], 2) if conv["valid"] and conv["rate"] is not None else 0
 
     # ── Portfolio summary (all values in CNY) ────────
+    # Load recent MarketPrice for daily close-to-close P&L
+    from collections import defaultdict
+    mp_close = defaultdict(list)  # ticker → [close_price, ...] sorted by date desc
+    if result:
+        all_mp = db.query(MarketPrice).filter(
+            MarketPrice.ticker.in_([it["asset_name"] for it in result])
+        ).order_by(MarketPrice.date.desc()).all()
+        for mp in all_mp:
+            if mp.close_price:
+                mp_close[mp.ticker].append(mp.close_price)
+
     total_cost_cny = 0
     total_value_cny = 0
     daily_pnl_cny = 0
@@ -1551,16 +1625,17 @@ def api_portfolio(refresh: bool = False, db: Session = Depends(get_db)):
             conv = convert_to_cny(it["total_cost"], it["currency"], db)
             if conv["valid"] and conv["rate"] is not None:
                 total_cost_cny += conv["value"]
-        # Convert current value to CNY
+        # Current value in CNY (pre-computed above)
+        val_cny = it.get("current_value_cny") or 0
         if it["current_value"] is not None:
-            if it["currency"] == "CNY":
-                val_cny = it["current_value"]
-            else:
-                conv = convert_to_cny(it["current_value"], it["currency"], db)
-                val_cny = conv["value"] if conv["valid"] and conv["rate"] is not None else 0
             total_value_cny += val_cny
-            # Daily P&L contribution
-            if it["change_pct"] is not None:
+            # Daily P&L: close-to-close from MarketPrice
+            closes = mp_close.get(it["asset_name"], [])
+            if len(closes) >= 2 and closes[1] > 0:
+                daily_ret = (closes[0] - closes[1]) / closes[1]
+                yesterday_val_cny = val_cny / (1 + daily_ret) if daily_ret != -1 else 0
+                daily_pnl_cny += yesterday_val_cny * daily_ret
+            elif it.get("change_pct") is not None:
                 daily_pnl_cny += val_cny * it["change_pct"] / 100
 
     # Sum fees from buy/sell records, convert to CNY
@@ -1625,109 +1700,192 @@ def _save_performance_cache(data: dict, db: Session):
 
 @app.get("/api/portfolio/performance")
 def api_portfolio_performance(refresh: bool = False, db: Session = Depends(get_db)):
-    """Return daily portfolio value + QQQ/SPY benchmarks since first transaction."""
+    """Return daily portfolio value + QQQ/SPY benchmarks since first transaction.
+
+    Uses MarketPrice table (local) as primary source. Only hits yfinance for
+    tickers with no local data, and for QQQ/SPY benchmarks if missing locally.
+    """
     from datetime import datetime as _dt, timedelta as _td
-    import yfinance as _yf
+    from datetime import date as _d
     import pandas as _pd
     import math as _math
 
-    # Use cache when available and not forcing refresh
+    # ── Cache ──────────────────────────────────────────
     if not refresh:
         cached = _load_performance_cache(db)
         if cached.get("dates"):
-            return {"dates": cached["dates"], "portfolio": cached["portfolio"],
-                    "qqq": cached.get("qqq", []), "spy": cached.get("spy", [])}
+            today_str = _d.today().isoformat()
+            latest = cached["dates"][-1] if cached["dates"] else ""
+            if latest >= today_str:
+                return {"dates": cached["dates"], "portfolio": cached["portfolio"],
+                        "qqq": cached.get("qqq", []), "spy": cached.get("spy", []),
+                        "cached": True, "cache_date": latest}
 
     rows = db.query(InvestmentRecord).order_by(InvestmentRecord.date).all()
     if not rows:
         return {"dates": [], "portfolio": [], "qqq": [], "spy": []}
 
-    # Find date range
     start_date = min(r.date for r in rows)
     end_date = _dt.now().strftime("%Y-%m-%d")
+    dr = _pd.date_range(start=start_date, end=end_date, freq="D")
+    dates = [d.strftime("%Y-%m-%d") for d in dr]
+    n = len(dates)
 
-    # Get closing prices for all assets + QQQ/SPY
-    tickers = set(r.asset_name for r in rows if r.type in ("buy", "sell"))
-    tickers.update(["QQQ", "SPY"])
-    closes = {}
-    for tkr in tickers:
-        try:
-            tk = _yf.Ticker(tkr)
-            hist = tk.history(start=start_date, end=end_date, auto_adjust=True)
-            if not hist.empty:
-                closes[tkr] = hist["Close"]
-        except Exception:
-            pass
+    portfolio_tickers = [t for t in set(r.asset_name for r in rows if r.type in ("buy", "sell"))]
+    bench_tickers = ["QQQ", "SPY"]
+    all_tickers = portfolio_tickers + bench_tickers
 
-    if not closes:
-        # Return cached data as fallback
+    # ── Step 1: build closes from local MarketPrice ─────
+    all_mp = db.query(MarketPrice).filter(
+        MarketPrice.ticker.in_(all_tickers),
+        MarketPrice.date >= start_date,
+    ).order_by(MarketPrice.date).all()
+
+    mp_map = {}  # ticker → {date: close_price}
+    for mp in all_mp:
+        mp_map.setdefault(mp.ticker, {})[mp.date] = mp.close_price
+
+    mp_series = {}  # ticker → pd.Series
+    for tkr in all_tickers:
+        pts = mp_map.get(tkr, {})
+        if pts:
+            s = _pd.Series(pts, name=tkr)
+            s.index = _pd.to_datetime(s.index)
+            mp_series[tkr] = s
+
+    df_local = _pd.DataFrame(mp_series).sort_index().ffill() if mp_series else _pd.DataFrame()
+    # Reindex to full date range, forward-fill
+    if not df_local.empty:
+        df_local = df_local.reindex(dr, method="ffill")
+
+    # ── Step 2: yfinance for missing tickers ────────────
+    local_tickers = set(df_local.columns)
+    fetch_tickers = [t for t in all_tickers if t not in local_tickers]
+    yf_data = {}
+    if fetch_tickers:
+        import yfinance as _yf
+        for tkr in fetch_tickers:
+            try:
+                tk = _yf.Ticker(tkr)
+                hist = tk.history(start=start_date, end=end_date, auto_adjust=True)
+                if not hist.empty:
+                    s = hist["Close"]
+                    s.name = tkr
+                    yf_data[tkr] = s
+                    # Persist to MarketPrice for future loads
+                    for di, px in s.items():
+                        ds = di.strftime("%Y-%m-%d") if hasattr(di, "strftime") else str(di)[:10]
+                        if _math.isnan(float(px)):
+                            continue
+                        exist = db.query(MarketPrice).filter(
+                            MarketPrice.ticker == tkr, MarketPrice.date == ds
+                        ).first()
+                        if not exist:
+                            db.add(MarketPrice(ticker=tkr, date=ds, close_price=float(px),
+                                               source="yfinance", updated_at=_now()))
+                    db.commit()
+            except Exception:
+                pass
+
+    df_yf = _pd.DataFrame(yf_data).sort_index().ffill() if yf_data else _pd.DataFrame()
+    if not df_yf.empty:
+        df_yf = df_yf.reindex(dr, method="ffill")
+
+    # ── Merge ──────────────────────────────────────────
+    if not df_local.empty and not df_yf.empty:
+        df = df_local.copy()
+        for col in df_yf.columns:
+            if col not in df.columns:
+                df[col] = df_yf[col]
+    elif not df_local.empty:
+        df = df_local
+    elif not df_yf.empty:
+        df = df_yf
+    else:
         cached = _load_performance_cache(db)
         if cached.get("dates"):
             return {"dates": cached["dates"], "portfolio": cached["portfolio"],
                     "qqq": cached.get("qqq", []), "spy": cached.get("spy", [])}
         return {"dates": [], "portfolio": [], "qqq": [], "spy": []}
 
-    # Build combined price index
-    df = _pd.DataFrame(closes).ffill()
-    dates = [d.strftime("%Y-%m-%d") for d in df.index]
+    df = df.ffill().bfill()  # forward-fill then back-fill initial NaN
+    closes = {tkr: df[tkr].tolist() for tkr in df.columns if tkr in portfolio_tickers}
 
-    # Compute daily portfolio value
-    port_val = [0.0] * len(df)
-    # For each buy/sell, accumulate shares at each point
-    ticker_shares = {t: [0.0] * len(df) for t in tickers if t not in ("QQQ", "SPY")}
+    if not closes:
+        return {"dates": [], "portfolio": [], "qqq": [], "spy": []}
+
+    # ── Step 3: build CNY exchange rates per ticker ─────
+    ticker_currency = {}
+    for r in rows:
+        if r.asset_name not in ticker_currency and r.currency:
+            ticker_currency[r.asset_name] = r.currency
+    ticker_fx = {}
+    for tkr, curr in ticker_currency.items():
+        if curr == "CNY":
+            ticker_fx[tkr] = 1.0
+        else:
+            conv = convert_to_cny(1, curr, db)
+            ticker_fx[tkr] = conv["value"] if conv["valid"] and conv["rate"] is not None else 1.0
+
+    # ── Step 4: compute daily portfolio value in CNY ────
+    port_val = [0.0] * n
+    ticker_shares = {t: [0.0] * n for t in closes}
     for r in rows:
         if r.type not in ("buy", "sell") or r.asset_name not in ticker_shares:
             continue
         tkr = r.asset_name
         qty = r.quantity or 0
-        date_str = r.date
         try:
-            idx = dates.index(date_str)
+            idx = dates.index(r.date)
         except ValueError:
             continue
         if r.type == "buy":
-            for i in range(idx, len(df)):
+            for i in range(idx, n):
                 ticker_shares[tkr][i] += qty
         elif r.type == "sell":
-            for i in range(idx, len(df)):
+            for i in range(idx, n):
                 ticker_shares[tkr][i] -= qty
 
-    for i in range(len(df)):
+    for i in range(n):
         v = 0.0
         for tkr, sh in ticker_shares.items():
-            if tkr in closes and i < len(closes[tkr]):
-                px = float(closes[tkr].iloc[i])
-                if not _math.isnan(px):
-                    v += sh[i] * px
+            cl = closes.get(tkr, [])
+            if i < len(cl):
+                px = cl[i]
+                if px is not None and not (isinstance(px, float) and _math.isnan(px)):
+                    rate = ticker_fx.get(tkr, 1.0)
+                    v += sh[i] * px * rate
         port_val[i] = round(v, 2)
 
-    # Cumulative return accounting for cash flows (cost basis)
+    # ── Step 5: cumulative return vs cost basis in CNY ──
     cum_cost = 0.0
-    costs = [0.0] * len(df)
+    costs = [0.0] * n
     for r in rows:
+        rate = ticker_fx.get(r.asset_name, 1.0)
         if r.type == "buy":
-            cum_cost += r.total_amount + (r.fees or 0)
+            cum_cost += (r.total_amount + (r.fees or 0)) * rate
         elif r.type == "sell":
-            cum_cost -= r.total_amount - (r.fees or 0)
+            cum_cost -= (r.total_amount - (r.fees or 0)) * rate
         try:
             idx = dates.index(r.date)
             costs[idx] = cum_cost
         except ValueError:
             pass
-    # Forward-fill costs
-    for i in range(1, len(costs)):
+    for i in range(1, n):
         if costs[i] == 0:
-            costs[i] = costs[i-1]
+            costs[i] = costs[i - 1]
 
-    port_pct = [round((port_val[i] / costs[i] - 1) * 100, 2) if costs[i] > 0 else 0 for i in range(len(port_val))]
+    port_pct = [round((port_val[i] / costs[i] - 1) * 100, 2) if costs[i] > 0 else 0 for i in range(n)]
     qqq_pct = []
     spy_pct = []
-    if "QQQ" in closes and len(closes["QQQ"]) > 0:
-        qqq0 = float(closes["QQQ"].iloc[0])
-        qqq_pct = [round((float(closes["QQQ"].iloc[i]) / qqq0 - 1) * 100, 2) for i in range(len(df))]
-    if "SPY" in closes and len(closes["SPY"]) > 0:
-        spy0 = float(closes["SPY"].iloc[0])
-        spy_pct = [round((float(closes["SPY"].iloc[i]) / spy0 - 1) * 100, 2) for i in range(len(df))]
+    if "QQQ" in df.columns:
+        qqq0 = float(df["QQQ"].iloc[0]) if not _math.isnan(float(df["QQQ"].iloc[0])) else None
+        if qqq0:
+            qqq_pct = [round((float(df["QQQ"].iloc[i]) / qqq0 - 1) * 100, 2) for i in range(n)]
+    if "SPY" in df.columns:
+        spy0 = float(df["SPY"].iloc[0]) if not _math.isnan(float(df["SPY"].iloc[0])) else None
+        if spy0:
+            spy_pct = [round((float(df["SPY"].iloc[i]) / spy0 - 1) * 100, 2) for i in range(n)]
 
     result = {"dates": dates, "portfolio": port_pct, "qqq": qqq_pct, "spy": spy_pct}
     _save_performance_cache(result, db)
@@ -2145,6 +2303,289 @@ def _fetch_price(symbol: str, currency: str, db: Session, asset_type: str = "sto
     return None, None, None, None
 
 
+# ── Market data refresh (background + manual) ──────────────────
+
+def _market_closed_for_date(market: str, date_str: str) -> bool:
+    """True if market has definitely closed for the given date (Beijing time perspective).
+
+    CN  → after 15:30 same day (A-shares/ETF); funds NAV ~20:00
+    US  → after 05:00 next day   (16:00 ET = 04:00-05:00 Beijing next day)
+    HK  → after 16:00 same day   (HKT = Beijing time)
+    Crypto → always True (24/7)
+    """
+    from datetime import datetime as _dt, timedelta as _td
+    now = _dt.now()
+    target = _dt.strptime(date_str, "%Y-%m-%d")
+    if target.weekday() >= 5:
+        return False  # weekend — no trading, nothing to fetch
+
+    if market == "CN":
+        return now > target.replace(hour=15, minute=30)
+    elif market == "US":
+        cutoff = (target + _td(days=1)).replace(hour=5, minute=0)
+        return now > cutoff
+    elif market == "HK":
+        return now > target.replace(hour=16, minute=0)
+    return True  # crypto / forex / commodity — always available
+
+
+def _resolve_market_for_ticker(asset_type: str, symbol: str = "") -> str:
+    """Map asset_type + symbol to market code for close-time logic."""
+    if asset_type in ("fund",):
+        return "CN"
+    if asset_type in ("crypto", "forex", "commodity"):
+        return "crypto"  # always available
+    # Distinguish by symbol pattern: 6 digits = CN, 1-5 digits = HK, letters = US
+    if symbol and symbol.isdigit():
+        if len(symbol) == 6:
+            return "CN"
+        return "HK"
+    return "US"
+
+
+def _batch_fetch_historical(symbol: str, market: str, missing_dates: list, db: Session):
+    """Fetch historical closing prices for a list of missing dates.
+    Uses yfinance for US/HK stocks. Returns {date_str: close_price}.
+    """
+    if not missing_dates:
+        return {}
+    import yfinance as _yf
+    from datetime import datetime as _dt, timedelta as _td
+    try:
+        tk = _yf.Ticker(symbol)
+        start = _dt.strptime(missing_dates[0], "%Y-%m-%d") - _td(days=3)
+        end = _dt.strptime(missing_dates[-1], "%Y-%m-%d") + _td(days=1)
+        hist = tk.history(start=start, end=end, auto_adjust=True)
+        if hist.empty:
+            return {}
+        result = {}
+        for di, row in hist.iterrows():
+            ds = di.strftime("%Y-%m-%d")
+            if ds in missing_dates:
+                px = float(row["Close"])
+                if px > 0:
+                    result[ds] = px
+        return result
+    except Exception as e:
+        print(f"[market-refresh] yfinance historical failed for {symbol}: {e}")
+        return {}
+
+
+def _cn_historical_close(symbol: str, date_str: str):
+    """Fetch A-share closing price for a specific date via East Money K-line."""
+    import httpx as _httpx
+    try:
+        # Determine secid
+        if symbol.isdigit() and len(symbol) == 6:
+            prefix = "1." if symbol.startswith(("6", "5", "9")) else "0."
+            secid = prefix + symbol
+        else:
+            return None
+        d = date_str.replace("-", "")
+        url = (f"https://push2his.eastmoney.com/api/qt/stock/kline/get"
+               f"?secid={secid}&fields1=f1&fields2=f51,f52&klt=101&fqt=0"
+               f"&beg={d}&end={d}&lmt=1")
+        resp = _httpx.get(url, timeout=10)
+        data = resp.json()
+        klines = (data.get("data") or {}).get("klines") or []
+        if klines:
+            return float(klines[0].split(",")[2])  # close price
+    except Exception as e:
+        print(f"[market-refresh] CN historical failed for {symbol}: {e}")
+    return None
+
+
+def refresh_market_prices(tickers=None, db: Session = None):
+    """Incrementally refresh market prices from external sources.
+
+    Key rules:
+    1. Only request closing prices — skip dates whose market hasn't closed yet.
+    2. Only request missing dates — never re-fetch data we already have.
+    3. New tickers get their name resolved alongside price.
+    4. Past dates use historical API (yfinance for US/HK, East Money for CN).
+    5. Today's date uses _fetch_price (real-time / closing).
+
+    If tickers is None, gathers all tickers from InvestmentRecord + DcaPlan.
+    Returns {ticker: {price, name, change_pct}} for updated tickers.
+    """
+    from datetime import date as _d, datetime as _dt, timedelta as _td
+    today_str = _d.today().isoformat()
+    now = _dt.now()
+
+    # ── Gather tickers ────────────────────────────────
+    if tickers is None:
+        inv_tickers = db.query(InvestmentRecord.asset_name, InvestmentRecord.asset_type,
+                               InvestmentRecord.currency).filter(
+            InvestmentRecord.type.in_(["buy", "sell"])
+        ).distinct().all()
+        dca_tickers = db.query(DcaPlan.asset_name, DcaPlan.asset_type,
+                               DcaPlan.currency).distinct().all()
+        seen = {}
+        for name, atype, curr in inv_tickers:
+            seen[name] = (atype, curr)
+        for name, atype, curr in dca_tickers:
+            if name not in seen:
+                seen[name] = (atype, curr)
+        tickers = [(name, atype, curr) for name, (atype, curr) in seen.items()]
+
+    updated = {}
+
+    for item in tickers:
+        symbol, asset_type, currency = (item if isinstance(item, tuple)
+                                        else (item, "stock", "USD"))
+        market = _resolve_market_for_ticker(asset_type, symbol)
+
+        # ── Find first appearance date for this ticker ──
+        first_inv = db.query(InvestmentRecord.date).filter(
+            InvestmentRecord.asset_name == symbol
+        ).order_by(InvestmentRecord.date).first()
+        first_dca = db.query(DcaPlan.start_date).filter(
+            DcaPlan.asset_name == symbol
+        ).order_by(DcaPlan.start_date).first()
+        first_date_str = today_str
+        if first_inv:
+            first_date_str = min(first_date_str, first_inv.date)
+        if first_dca and first_dca.start_date:
+            first_date_str = min(first_date_str, first_dca.start_date)
+
+        # ── Determine which dates are missing from MarketPrice ──
+        missing_by_market = {}  # market → [date_str, ...]
+        need_name = True  # also fetch name for new tickers
+
+        d = _dt.strptime(first_date_str, "%Y-%m-%d")
+        end = _dt.strptime(today_str, "%Y-%m-%d")
+        while d <= end:
+            ds = d.strftime("%Y-%m-%d")
+            # Respect per-ticker market close time
+            m = _resolve_market_for_ticker(asset_type, symbol)
+            if not _market_closed_for_date(m, ds):
+                d += _td(days=1)
+                continue
+
+            mp = db.query(MarketPrice).filter(
+                MarketPrice.ticker == symbol, MarketPrice.date == ds
+            ).first()
+            if mp and mp.close_price:
+                if mp.name:
+                    need_name = False
+            else:
+                missing_by_market.setdefault(m, []).append(ds)
+            d += _td(days=1)
+
+        all_missing = []
+        for lst in missing_by_market.values():
+            all_missing.extend(lst)
+        if not all_missing and not need_name:
+            continue
+
+        # ── Fetch name if missing ──
+        name = None
+        if need_name:
+            mp_any = db.query(MarketPrice).filter(
+                MarketPrice.ticker == symbol
+            ).order_by(MarketPrice.date.desc()).first()
+            name = mp_any.name if (mp_any and mp_any.name and mp_any.name != symbol) else None
+
+        # ── Fetch missing data ─────────────────────────
+        today_missing = today_str in all_missing
+        past_missing = [d for d in all_missing if d != today_str]
+
+        # Past dates: batch historical
+        if past_missing:
+            past_missing.sort()
+            if market in ("US", "HK"):
+                hist = _batch_fetch_historical(symbol, market, past_missing, db)
+                for ds, px in hist.items():
+                    exist = db.query(MarketPrice).filter(
+                        MarketPrice.ticker == symbol, MarketPrice.date == ds
+                    ).first()
+                    if exist:
+                        exist.close_price = px
+                        exist.source = "auto"
+                        exist.updated_at = _now()
+                    else:
+                        db.add(MarketPrice(ticker=symbol, date=ds, close_price=px,
+                                           source="auto", updated_at=_now()))
+                    updated.setdefault(symbol, {})["price"] = px
+            elif market == "CN":
+                for ds in past_missing:
+                    px = _cn_historical_close(symbol, ds)
+                    if px:
+                        exist = db.query(MarketPrice).filter(
+                            MarketPrice.ticker == symbol, MarketPrice.date == ds
+                        ).first()
+                        if exist:
+                            exist.close_price = px
+                            exist.source = "auto"
+                            exist.updated_at = _now()
+                        else:
+                            db.add(MarketPrice(ticker=symbol, date=ds, close_price=px,
+                                               source="auto", updated_at=_now()))
+                        updated.setdefault(symbol, {})["price"] = px
+            # crypto: no historical close concept, skip past dates
+            db.flush()
+
+        # Today: _fetch_price (closing price if market closed, real-time for crypto)
+        if today_missing:
+            px, _, fetch_name, chg = _fetch_price(symbol, currency, db, asset_type)
+            if px is not None:
+                name = fetch_name or name
+                exist = db.query(MarketPrice).filter(
+                    MarketPrice.ticker == symbol, MarketPrice.date == today_str
+                ).first()
+                if exist:
+                    exist.close_price = px
+                    exist.change_pct = chg
+                    if name: exist.name = name
+                    exist.source = "auto"
+                    exist.updated_at = _now()
+                else:
+                    db.add(MarketPrice(ticker=symbol, date=today_str, close_price=px,
+                                       change_pct=chg, name=name,
+                                       source="auto", updated_at=_now()))
+                updated.setdefault(symbol, {}).update(
+                    {"price": px, "name": name, "change_pct": chg})
+
+        # ── Fill name for existing entries that lack it ──
+        if name:
+            nameless = db.query(MarketPrice).filter(
+                MarketPrice.ticker == symbol,
+                MarketPrice.name == None
+            ).all()
+            for mp in nameless:
+                mp.name = name
+
+    if updated:
+        db.commit()
+        global _last_market_refresh
+        _last_market_refresh = __import__("time").time()
+        print(f"[market-refresh] updated {len(updated)} tickers: {list(updated.keys())}")
+    return updated
+
+
+def _market_refresh_loop():
+    """Background thread: refresh market prices every hour."""
+    import time as _time
+    _time.sleep(10)  # brief delay for initial startup
+    while True:
+        try:
+            db = next(get_db())
+            try:
+                refresh_market_prices(db=db)
+            finally:
+                db.close()
+        except Exception as e:
+            print(f"[market-refresh] error: {e}")
+        _time.sleep(3600)
+
+
+def start_market_refresh_scheduler():
+    import threading
+    t = threading.Thread(target=_market_refresh_loop, daemon=True)
+    t.start()
+    print("[market-refresh] scheduler started (hourly)")
+
+
 # ── Exchange Rate API ────────────────────────────────────────
 
 @app.get("/api/exchange-rates")
@@ -2477,4 +2918,4 @@ async def api_backup_import_file(password: str = Form(...), file: UploadFile = F
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
+    uvicorn.run("main:app", host="127.0.0.1", port=8000)

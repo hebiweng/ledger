@@ -114,7 +114,7 @@ const freqLabels = { daily:'每日', weekly:'每周', biweekly:'双周', monthly
 
   loadDcaPlans();
   catchUpDca();
-  renderCharts(s);
+  renderCharts(P.portfolio);
 })();
 
 function renderCharts(portfolioData) {
@@ -122,7 +122,7 @@ function renderCharts(portfolioData) {
   if (!h.length) return;
   // Pie chart
   var typeMap = {};
-  h.forEach(function(x) { var t = x.asset_type || 'other'; typeMap[t] = (typeMap[t] || 0) + (x.current_value || 0); });
+  h.forEach(function(x) { var t = x.asset_type || 'other'; typeMap[t] = (typeMap[t] || 0) + (x.current_value_cny || 0); });
   var labels = Object.keys(typeMap);
   var data = Object.values(typeMap);
   var allColors = ['#427AB2','#F09148','#FF9896','#DBDB8D','#C59D94','#AFC7E8','#43978F','#9EC4BE','#ABD0F1','#E56F5E','#F19685','#F6C957','#FFB77F'];
@@ -160,14 +160,17 @@ async function catchUpDca() {
   try {
     var msR = await fetch('/api/market-status');
     var ms = await msR.json();
-    if (!ms.closed) return;
     var today = new Date().toISOString().slice(0,10);
     var r = await fetch('/api/dca-plans');
     var plans = await r.json();
     var executed = false;
+    var safety = 0;
     for (var i = 0; i < plans.length; i++) {
       var p = plans[i];
       while (p.is_active && p.next_date <= today && safety < 30) {
+        // Only skip today's execution when market hasn't closed yet.
+        // Past-due dates (yesterday and older) always execute — their market has closed.
+        if (p.next_date === today && !ms.closed) break;
         try {
           await fetch('/api/dca-plans/' + p.id + '/execute', { method:'POST' });
           executed = true;
@@ -181,7 +184,7 @@ async function catchUpDca() {
         safety++;
       }
     }
-    if (executed) loadDcaPlans();
+    if (executed) { loadDcaPlans(); refreshPortfolio(); }
   } catch(e) {}
 }
 
@@ -547,6 +550,18 @@ async function undoDeleteTrade() {
   });
   location.reload();
 }
+
+// ── SSE: listen for background market refresh ──
+(function() {
+  var es = new EventSource('/api/market-events');
+  es.onmessage = function(e) {
+    if (e.data === 'refreshed') {
+      refreshPortfolio();
+      loadDcaPlans();
+    }
+  };
+  es.onerror = function() { /* auto-reconnect built into EventSource */ };
+})();
 </script>
 
 <!-- Edit trade dialog -->
