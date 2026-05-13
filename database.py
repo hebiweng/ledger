@@ -28,5 +28,10 @@ def init_db():
     cols = {row[1] for row in cur.fetchall()}
     if "parent_id" not in cols:
         conn.execute("ALTER TABLE accounts ADD COLUMN parent_id INTEGER REFERENCES accounts(id)")
+    # dca_plans
+    cur = conn.execute("PRAGMA table_info(dca_plans)")
+    cols = {row[1] for row in cur.fetchall()}
+    if "start_date" not in cols:
+        conn.execute("ALTER TABLE dca_plans ADD COLUMN start_date VARCHAR")
     conn.commit()
     conn.close()
